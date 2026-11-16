@@ -1,13 +1,11 @@
 package com.arin.ghostbank.ui.vm
 
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.ghostbank.AppContainer
 import com.arin.ghostbank.data.db.LedgerRowEntity
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -15,65 +13,69 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class LedgerViewModel(private val container: AppContainer) : ViewModel() {
 
-    private val _bank = MutableStateFlow<String?>(null)
-    val bank: StateFlow<String?> = _bank.asStateFlow()
+    private val all = container.ledger.all()
 
-    private val _status = MutableStateFlow<String?>(null)
-    val status: StateFlow<String?> = _status.asStateFlow()
+    val bankFilter = MutableStateFlow<String?>(null)
+    val statusFilter = MutableStateFlow<String?>(null)
+    val daysFilter = MutableStateFlow(0)
 
-    private val _weekOnly = MutableStateFlow(true)
-    val weekOnly: StateFlow<Boolean> = _weekOnly.asStateFlow()
-
-    private val _message = MutableStateFlow<String?>(null)
-    val message: StateFlow<String?> = _message.asStateFlow()
-
-    val rows: StateFlow<List<LedgerRowEntity>> = combine(
-        container.ledger.all(), _bank, _status, _weekOnly
-    ) { all, bank, status, weekOnly ->
-        val cutoff = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
-        all.filter { row ->
-            (bank == null || row.bankCode == bank) &&
-                (status == null || row.status == status) &&
-                (!weekOnly || row.ts >= cutoff)
-        }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val rows: StateFlow<List<LedgerRowEntity>> =
+        combine(all, bankFilter, statusFilter, daysFilter) { list, bank, status, days ->
+            val cutoff = if (days == 0) 0L else System.currentTimeMillis() - days * 86_400_000L
+            list.filter { row ->
+                (bank == null || row.bankCode == bank) &&
+                    (status == null || row.status == status) &&
+                    (cutoff == 0L || row.ts >= cutoff)
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val credited: StateFlow<Long> = container.ledger.creditedPaise()
-        .let { flow ->
-            kotlinx.coroutines.flow.map(flow) { it ?: 0L }
-        }
+        .let { flow -> kotlinx.coroutines.flow.map(flow) { it ?: 0L } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
 
-    fun setBank(code: String?) { _bank.value = code }
-    fun setStatus(value: String?) { _status.value = value }
-    fun setWeekOnly(value: Boolean) { _weekOnly.value = value }
+    private val _message = MutableStateFlow<String?>(null)
+    val message = _message.asStateFlow()
 
-    fun export(onUri: (android.net.Uri) -> Unit) {
+    fun setBank(code: String?) {
+        bankFilter.value = code
+    }
+
+    fun setStatus(status: String?) {
+        statusFilter.value = status
+    }
+
+    fun setDays(days: Int) {
+        daysFilter.value = days
+    }
+
+    fun export() {
         viewModelScope.launch {
-            val current = rows.value
-            if (current.isEmpty()) {
-                _message.value = "no rows match the filter"
+            val list = rows.value
+            if (list.isEmpty()) {
+                _message.value = "nothing to export with these filters"
                 return@launch
             }
-            val uri = withContext(Dispatchers.IO) {
-                container.exporter.writeCsv(
-                    "ledger_export.csv",
-                    "ts,run_id,bank,direction,paise,utr,status,badge,counterparty",
-                    current.map { "${it.ts},${it.runId},${it.bankCode},${it.direction},${it.amountPaise},${it.utr ?: ""},${it.status},${it.badge},${it.counterparty ?: ""}" }
-                )
+            val lines = list.map {
+                "${it.ts},${it.bankCode},${it.direction},${it.amountPaise},${it.utr.orEmpty()},${it.status},${it.badge}"
             }
-            onUri(uri)
+            val uri = container.exporter.writeCsv(
+                "ghostbank-ledger.csv",
+                "timestamp,bank,direction,paise,utr,status,badge",
+                lines
+            )
+            container.exporter.share(uri, "GhostBank ledger")
         }
     }
 
-    fun dismissMessage() { _message.value = null }
+    fun clearMessage() {
+        _message.value = null
+    }
 
     companion object {
-        fun factory(container: AppContainer): ViewModelProvider.Factory = viewModelFactory {
+        fun factory(container: AppContainer) = viewModelFactory {
             initializer { LedgerViewModel(container) }
         }
     }

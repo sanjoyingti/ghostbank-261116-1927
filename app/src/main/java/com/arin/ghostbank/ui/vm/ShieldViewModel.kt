@@ -1,7 +1,6 @@
 package com.arin.ghostbank.ui.vm
 
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -19,35 +18,31 @@ import kotlinx.coroutines.launch
 
 class ShieldViewModel(private val container: AppContainer) : ViewModel() {
 
-    private val _report = MutableStateFlow<LeakReport?>(null)
-    val report: StateFlow<LeakReport?> = _report.asStateFlow()
-
-    private val _probing = MutableStateFlow(false)
-    val probing: StateFlow<Boolean> = _probing.asStateFlow()
-
-    val scores: StateFlow<List<StealthScoreEntity>> = container.db.scores().recent()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val settings: StateFlow<Settings> = container.settings.flow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, Settings())
 
     val runs: StateFlow<List<RunEntity>> = container.runs.recent()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val settings: StateFlow<Settings> = container.settings.flow
-        .stateIn(viewModelScope, SharingStarted.Eagerly, Settings())
+    val scores: StateFlow<List<StealthScoreEntity>> = container.db.scores().recent()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val registryCount: StateFlow<Int> = container.registry.count()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+    private val _report = MutableStateFlow<LeakReport?>(null)
+    val report = _report.asStateFlow()
+
+    private val _busy = MutableStateFlow(false)
+    val busy = _busy.asStateFlow()
 
     fun probe() {
-        if (_probing.value) return
         viewModelScope.launch {
-            _probing.value = true
-            _report.value = container.leakLab.probe(settings.value)
-            _probing.value = false
+            _busy.value = true
+            _report.value = runCatching { container.leakLab.probe(settings.value) }.getOrNull()
+            _busy.value = false
         }
     }
 
     companion object {
-        fun factory(container: AppContainer): ViewModelProvider.Factory = viewModelFactory {
+        fun factory(container: AppContainer) = viewModelFactory {
             initializer { ShieldViewModel(container) }
         }
     }
