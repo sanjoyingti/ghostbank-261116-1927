@@ -1,16 +1,18 @@
+=== ABOUT: Small helpers that turn paise into readable rupee text and timestamps into clock times ===
 package com.arin.ghostbank.ui.components
 
-import com.arin.ghostbank.model.HarvestStatus
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-fun rupees(paise: Long?): String {
-    if (paise == null) return "—"
-    val whole = paise / 100
+fun paiseToRupeeText(paise: Long): String {
+    val rupees = paise / 100
     val fraction = paise % 100
-    val grouped = whole.toString().reversed().chunked(3).joinToString(",").reversed()
-    return if (fraction == 0L) "₹$grouped" else "₹$grouped.${fraction.toString().padStart(2, '0')}"
+    return "₹$rupees.${fraction.toString().padStart(2, '0')}"
 }
 
-fun paiseLabel(paise: Long?): String = "${paise ?: 0L} paise"
+fun paiseSummary(paise: Long): String = "${paiseToRupeeText(paise)} · $paise paise"
 
-fun harvestStatusOf(value: String?): HarvestStatus =
-    runCatching { HarvestStatus.valueOf(value.orEmpty()) }.getOrDefault(HarvestStatus.PENDING)
+fun timeText(ts: Long): String = SimpleDateFormat("dd MMM HH:mm:ss", Locale.US).format(Date(ts))
+
+fun dateText(ts: Long): String = SimpleDateFormat("dd MMM yyyy", Locale.US).format(Date(ts))

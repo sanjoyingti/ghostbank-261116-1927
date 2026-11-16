@@ -1,3 +1,4 @@
+=== ABOUT: The near-black window background so the app never flashes white on launch ===
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.GhostBank" parent="android:Theme.Material.NoActionBar">
