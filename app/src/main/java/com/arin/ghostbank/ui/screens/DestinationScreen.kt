@@ -1,17 +1,27 @@
-=== ABOUT: Fixed the missing destination screen: it checks the branch code shape, resolves the branch, runs a payee name check and masks the digits once saved ===
 package com.arin.ghostbank.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -19,165 +29,194 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.ghostbank.AppContainer
 import com.arin.ghostbank.data.BranchResolver
+import com.arin.ghostbank.data.db.AccountEntity
+import com.arin.ghostbank.model.Badge
 import com.arin.ghostbank.model.Banks
 import com.arin.ghostbank.model.Ids
 import com.arin.ghostbank.ui.components.BackBar
+import com.arin.ghostbank.ui.components.BadgeChip
+import com.arin.ghostbank.ui.components.KeyValue
 import com.arin.ghostbank.ui.components.Panel
-import com.arin.ghostbank.ui.components.ScreenColumn
+import com.arin.ghostbank.ui.components.SectionTitle
 import com.arin.ghostbank.ui.components.TerminalButton
 import com.arin.ghostbank.ui.components.TerminalField
 import com.arin.ghostbank.ui.theme.Amber
-import com.arin.ghostbank.ui.theme.Cyan
 import com.arin.ghostbank.ui.theme.Green
-import com.arin.ghostbank.ui.theme.Red
+import com.arin.ghostbank.ui.theme.Ink
 import com.arin.ghostbank.ui.theme.TextDim
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 class DestinationViewModel(private val container: AppContainer) : ViewModel() {
 
-    data class Ui(
-        val number: String = "",
-        val ifsc: String = "",
-        val holder: String = "",
-        val ifscHint: String? = null,
-        val branch: String? = null,
-        val nameCheck: String? = null,
-        val nameCheckOk: Boolean? = null,
-        val message: String? = null,
-        val savedMasked: String? = null,
-        val busy: Boolean = false
-    )
+    var number by mutableStateOf("")
+    var ifsc by mutableStateOf("")
+    var holder by mutableStateOf("")
+    var error by mutableStateOf<String?>(null)
+    var checkState by mutableStateOf<String?>(null)
+    var checked by mutableStateOf<Badge?>(null)
 
-    private val _ui = MutableStateFlow(Ui())
-    val state: StateFlow<Ui> = _ui
+    private val _saved = MutableStateFlow<AccountEntity?>(null)
+    val saved: StateFlow<AccountEntity?> = _saved.asStateFlow()
 
     init {
         viewModelScope.launch {
-            container.accounts.current()?.let { existing ->
-                _ui.value = _ui.value.copy(
-                    number = existing.number,
-                    ifsc = existing.ifsc,
-                    holder = existing.holderName.orEmpty(),
-                    ifscHint = BranchResolver.formatHint(existing.ifsc),
-                    branch = BranchResolver.resolve(existing.ifsc)?.let { "${it.bankName} · ${it.branchLabel}" }
-                )
+            container.accounts.destination().collect { existing ->
+                _saved.value = existing
+                if (existing != null && number.isBlank()) {
+                    number = existing.number
+                    ifsc = existing.ifsc
+                    holder = existing.holderName.orEmpty()
+                }
             }
         }
     }
 
-    fun setNumber(value: String) {
-        _ui.value = _ui.value.copy(number = value.filter { it.isLetterOrDigit() }.take(18), message = null)
+    private fun validate(): String? = when {
+        number.filter { it.isDigit() }.length < 9 -> "Account number needs at least 9 digits"
+        number.filter { it.isDigit() }.length > 18 -> "Account number is longer than 18 digits"
+        !Banks.isValidIfsc(ifsc) -> "IFSC must be 4 letters, a 0, then 6 letters or digits"
+        Banks.byIfsc(ifsc) == null -> "That IFSC is not one of the 27 supported banks"
+        else -> null
     }
 
-    fun setIfsc(value: String) {
-        val clean = value.uppercase().filter { it.isLetterOrDigit() }.take(11)
-        _ui.value = _ui.value.copy(
-            ifsc = clean,
-            ifscHint = if (clean.length >= 11) BranchResolver.formatHint(clean) else null,
-            branch = BranchResolver.resolve(clean)?.let { "${it.bankName} · ${it.branchLabel}" },
-            message = null
-        )
-    }
-
-    fun setHolder(value: String) {
-        _ui.value = _ui.value.copy(holder = value.take(40), nameCheck = null, nameCheckOk = null)
-    }
-
-    fun nameCheck() {
-        val ui = _ui.value
-        when {
-            ui.holder.trim().length < 3 -> {
-                _ui.value = ui.copy(nameCheck = "holder name needs at least 3 characters", nameCheckOk = false)
-                return
-            }
-            !Banks.isValidIfsc(ui.ifsc) -> {
-                _ui.value = ui.copy(nameCheck = "fix the IFSC first — the bank checks the name against that account", nameCheckOk = false)
-                return
-            }
-        }
+    /** Name check against the bank's own payee validation: a real request, marked LIVE only on a server answer. */
+    fun runNameCheck() {
+        val problem = validate()
+        if (problem != null) { error = problem; return }
+        error = null
+        checkState = "checking payee with ${Banks.byIfsc(ifsc)?.name}…"
         viewModelScope.launch {
-            _ui.value = _ui.value.copy(nameCheck = "asking the bank to validate the payee…", nameCheckOk = null, busy = true)
-            delay(900)
-            val bank = Banks.byIfsc(_ui.value.ifsc)
-            val ok = bank != null && ui.holder.trim().all { it.isLetter() || it == ' ' || it == '.' }
-            _ui.value = _ui.value.copy(
-                busy = false,
-                nameCheckOk = ok,
-                nameCheck = if (ok)
-                    "shape accepted by ${bank?.name} payee rules — the real server still has the last word (SIMULATED)"
-                else "the bank's payee rules expect letters only — check the spelling"
-            )
+            val outcome = container.payeeCheck(ifsc, number)
+            checked = outcome.first
+            checkState = outcome.second
         }
     }
 
-    fun save() {
-        val ui = _ui.value
-        val bank = Banks.byIfsc(ui.ifsc)
-        val problem = when {
-            ui.number.filter { it.isDigit() }.length !in 9..18 -> "Account number should be 9 to 18 digits"
-            !Banks.isValidIfsc(ui.ifsc) -> "IFSC must be 4 letters, a 0, then 6 letters or digits"
-            bank == null -> "That IFSC belongs to a bank outside the 27 supported"
-            ui.holder.trim().length < 3 -> "Holder name needs at least 3 characters"
-            else -> null
-        }
-        if (problem != null) {
-            _ui.value = ui.copy(message = problem)
-            return
-        }
+    fun save(onSaved: () -> Unit) {
+        val problem = validate()
+        if (problem != null) { error = problem; return }
+        val bank = Banks.byIfsc(ifsc)!!
+        error = null
         viewModelScope.launch {
-            _ui.value = ui.copy(busy = true, message = null)
-            container.accounts.saveDestination(ui.number.trim(), ui.ifsc, ui.holder.trim(), bank!!.code)
+            container.accounts.saveDestination(number.filter { it.isDigit() }, ifsc.trim().uppercase(), holder.ifBlank { null }, bank.code)
             container.settings.setDestinationSaved(true)
-            _ui.value = _ui.value.copy(busy = false, savedMasked = Ids.maskNumber(ui.number.trim()), message = "destination saved — digits masked")
+            onSaved()
         }
+    }
+
+    companion object {
+        fun factory(container: AppContainer) = viewModelFactory { initializer { DestinationViewModel(container) } }
     }
 }
 
 @Composable
 fun DestinationScreen(container: AppContainer, onBack: () -> Unit) {
     val vm: DestinationViewModel = viewModel(factory = DestinationViewModel.factory(container))
-    val state by vm.state.collectAsStateWithLifecycle()
+    val saved by vm.saved.collectAsStateWithLifecycle()
+    var confirmed by remember { mutableStateOf(false) }
 
-    ScreenColumn {
-        BackBar("Destination account", "one active destination, editable", onBack)
-        Text(
-            "Your bank always knows this number — GhostBank cannot change that. What it does is mask the digits to the last four, route every leg through a virtual account and keep one frozen identity per source account.",
-            style = MaterialTheme.typography.bodySmall,
-            color = TextDim
-        )
-        TerminalField("ACCOUNT NUMBER", state.number, vm::setNumber, numeric = true)
-        TerminalField("IFSC", state.ifsc, vm::setIfsc, error = state.ifscHint, placeholder = "HDFC0000123")
-        Text(state.branch ?: "branch appears once the IFSC is complete", style = MaterialTheme.typography.labelSmall, color = Cyan)
-        TerminalField("ACCOUNT HOLDER NAME", state.holder, vm::setHolder, placeholder = "as printed on the passbook")
+    LaunchedEffect(saved) { if (saved != null) confirmed = false }
 
-        TerminalButton(if (state.busy) "working…" else "run payee name check", vm::nameCheck, color = Cyan, enabled = !state.busy)
-        state.nameCheck?.let { line ->
-            Panel(border = if (state.nameCheckOk == true) Green else Amber) {
-                Text(line, style = MaterialTheme.typography.bodySmall, color = if (state.nameCheckOk == true) Green else Amber)
+    Column(Modifier.fillMaxSize().background(Ink)) {
+        BackBar("DESTINATION ACCOUNT", "the fixed landing point for every leg", onBack)
+        Column(
+            Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            if (saved != null) {
+                Panel(border = Green) {
+                    Column {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("SAVED DESTINATION", style = MaterialTheme.typography.labelSmall, color = Green)
+                            BadgeChip(Badge.SIMULATED)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        KeyValue("masked", Ids.maskNumber(saved!!.number), Green)
+                        KeyValue("ifsc", saved!!.ifsc)
+                        KeyValue("bank", Banks.byCode(saved!!.bankCode)?.name ?: saved!!.bankCode)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "The destination bank always knows this number. GhostBank only hides it from everyone else.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Amber
+                        )
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
             }
-        }
 
-        TerminalButton(if (state.busy) "saving…" else "save destination", vm::save, enabled = !state.busy)
-        state.message?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = if (state.savedMasked != null) Green else Red) }
-        state.savedMasked?.let {
-            Text("active: $it", style = MaterialTheme.typography.titleSmall, color = Green)
+            SectionTitle("NEW DESTINATION", "One active destination at a time; saving replaces the old one.")
+            TerminalField(
+                label = "account number",
+                value = vm.number,
+                onChange = { vm.number = it.filter { c -> c.isDigit() } },
+                placeholder = "50100234987121",
+                numeric = true
+            )
+            Spacer(Modifier.height(10.dp))
+            TerminalField(
+                label = "IFSC",
+                value = vm.ifsc,
+                onChange = { vm.ifsc = it.uppercase().take(11) },
+                placeholder = "HDFC0000123",
+                error = vm.error ?: BranchResolver.formatHint(vm.ifsc)
+            )
+            val branch = BranchResolver.resolve(vm.ifsc)
+            if (branch != null) {
+                Spacer(Modifier.height(8.dp))
+                Panel(border = Green) {
+                    Column {
+                        Text("BRANCH RESOLVED", style = MaterialTheme.typography.labelSmall, color = Green)
+                        Text("${branch.bankName} — ${branch.branchLabel}", style = MaterialTheme.typography.bodySmall, color = TextDim)
+                    }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            TerminalField(
+                label = "holder name (optional)",
+                value = vm.holder,
+                onChange = { vm.holder = it.take(40) },
+                placeholder = "as printed on the passbook"
+            )
+
+            Spacer(Modifier.height(14.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                TerminalButton("CHECK PAYEE", { vm.runNameCheck() }, color = Amber, modifier = Modifier.weight(1f))
+                TerminalButton(
+                    "SAVE",
+                    { if (confirmed) vm.save { } else confirmed = true },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            if (!confirmed) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Save is armed in two taps so a typo cannot become the fixed destination.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextDim
+                )
+            }
+
+            if (vm.checkState != null) {
+                Spacer(Modifier.height(12.dp))
+                Panel(border = if (vm.checked == Badge.LIVE) Green else Amber) {
+                    Column {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("PAYEE NAME CHECK", style = MaterialTheme.typography.labelSmall, color = TextDim)
+                            if (vm.checked != null) BadgeChip(vm.checked!!)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(vm.checkState!!, style = MaterialTheme.typography.bodySmall, color = TextDim)
+                    }
+                }
+            }
+            Spacer(Modifier.height(30.dp))
         }
-        Spacer(Modifier.height(8.dp))
-        Text("Virtual accounts rotate in front of this number when Trace-Shield is on, so the rail sees a different payee each run.", style = MaterialTheme.typography.bodySmall, color = TextDim)
     }
 }
-
-private fun DestinationViewModel.Companion.unusedMarker() = Unit
-
-class DestinationViewModelFactory
-
-private fun DestinationViewModel.factoryHelper() = Unit
-
-fun DestinationViewModel.Companion.factory(container: AppContainer): ViewModelProvider.Factory = viewModelFactory {
-    initializer { DestinationViewModel(container) }
-}
-
-private val DestinationViewModel.Companion.marker: Unit get() = Unit

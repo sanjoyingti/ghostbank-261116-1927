@@ -1,32 +1,40 @@
-=== ABOUT: Fixed the missing three-page welcome: the honesty card, the stealth dial, and your account setup ===
 package com.arin.ghostbank.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.ghostbank.AppContainer
 import com.arin.ghostbank.data.BranchResolver
 import com.arin.ghostbank.model.Banks
 import com.arin.ghostbank.model.StealthLevel
-import com.arin.ghostbank.ui.components.EmptyState
+import com.arin.ghostbank.ui.components.ConfirmDialog
 import com.arin.ghostbank.ui.components.Panel
 import com.arin.ghostbank.ui.components.Pill
-import com.arin.ghostbank.ui.components.ScreenColumn
+import com.arin.ghostbank.ui.components.SectionTitle
 import com.arin.ghostbank.ui.components.TerminalButton
 import com.arin.ghostbank.ui.components.TerminalField
 import com.arin.ghostbank.ui.components.clickableNoRipple
@@ -34,125 +42,176 @@ import com.arin.ghostbank.ui.components.levelColor
 import com.arin.ghostbank.ui.theme.Amber
 import com.arin.ghostbank.ui.theme.Cyan
 import com.arin.ghostbank.ui.theme.Green
-import com.arin.ghostbank.ui.theme.Hairline
+import com.arin.ghostbank.ui.theme.Ink
 import com.arin.ghostbank.ui.theme.Red
 import com.arin.ghostbank.ui.theme.TextDim
+import com.arin.ghostbank.ui.theme.TextPrimary
 import kotlinx.coroutines.launch
 
-@Composable
-fun OnboardingScreen(container: AppContainer, onDone: () -> Unit) {
-    val scope = rememberCoroutineScope()
-    var page by rememberSaveable { mutableIntStateOf(0) }
-    var level by rememberSaveable { mutableStateOf(StealthLevel.STANDARD.name) }
-    var number by rememberSaveable { mutableStateOf("") }
-    var ifsc by rememberSaveable { mutableStateOf("") }
-    var holder by rememberSaveable { mutableStateOf("") }
-    var error by rememberSaveable { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
-    val hint = BranchResolver.formatHint(ifsc)
+class OnboardingViewModel(private val container: AppContainer) : ViewModel() {
 
-    fun finish(storeDestination: Boolean) {
-        if (busy) return
-        if (storeDestination) {
-            val bank = Banks.byIfsc(ifsc)
-            when {
-                number.filter { it.isDigit() }.length !in 9..18 -> { error = "Account number should be 9 to 18 digits"; return }
-                !Banks.isValidIfsc(ifsc) || bank == null -> { error = "IFSC must be 4 letters, a 0, then 6 letters or digits, on a supported bank"; return }
-                holder.trim().length < 3 -> { error = "Holder name needs at least 3 characters"; return }
-            }
-            busy = true
-            scope.launch {
-                container.accounts.saveDestination(number.trim(), ifsc, holder.trim(), bank!!.code)
-                container.settings.setDestinationSaved(true)
-                container.settings.setStealthLevel(StealthLevel.valueOf(level))
-                container.settings.setOnboardingDone(true)
-                busy = false
-                onDone()
-            }
-        } else {
-            scope.launch {
-                container.settings.setStealthLevel(StealthLevel.valueOf(level))
-                container.settings.setOnboardingDone(true)
-                onDone()
-            }
+    var number by mutableStateOf("")
+    var ifsc by mutableStateOf("")
+    var error by mutableStateOf<String?>(null)
+    var saved by mutableStateOf(false)
+
+    fun save(onDone: () -> Unit) {
+        val clean = ifsc.trim().uppercase()
+        when {
+            number.filter { it.isDigit() }.length < 9 -> { error = "Account number needs at least 9 digits"; return }
+            !Banks.isValidIfsc(clean) -> { error = "IFSC must be 4 letters, a 0, then 6 letters or digits"; return }
+            Banks.byIfsc(clean) == null -> { error = "That IFSC is not one of the 27 supported banks"; return }
+        }
+        val bank = Banks.byIfsc(clean)!!
+        viewModelScope.launch {
+            container.accounts.saveDestination(number.filter { it.isDigit() }, clean, null, bank.code)
+            container.settings.setDestinationSaved(true)
+            container.settings.setOnboardingDone(true)
+            saved = true
+            onDone()
         }
     }
 
-    ScreenColumn {
-        Text("// onboarding ${page + 1} of 3", style = MaterialTheme.typography.labelSmall, color = TextDim)
+    fun setLevel(level: StealthLevel) = viewModelScope.launch { container.settings.setStealthLevel(level) }
+
+    fun finishWithoutAccount() = viewModelScope.launch { container.settings.setOnboardingDone(true) }
+
+    companion object {
+        fun factory(container: AppContainer) = viewModelFactory { initializer { OnboardingViewModel(container) } }
+    }
+}
+
+@Composable
+fun OnboardingScreen(container: AppContainer, onDone: () -> Unit) {
+    val vm: OnboardingViewModel = viewModel(factory = OnboardingViewModel.factory(container))
+    var page by remember { mutableStateOf(0) }
+    var confirmSkip by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Ink)
+            .verticalScroll(rememberScrollState())
+            .padding(20.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("GHOSTBANK", style = MaterialTheme.typography.titleMedium, color = Green)
+            Text("${page + 1}/3", style = MaterialTheme.typography.labelSmall, color = TextDim)
+        }
+        Spacer(Modifier.height(24.dp))
 
         when (page) {
-            0 -> Panel(border = Amber) {
-                Column {
-                    Text("THE HONEST CARD", style = MaterialTheme.typography.titleSmall, color = Amber)
-                    Spacer(Modifier.height(8.dp))
+            0 -> {
+                Text("THE HONEST CARD", style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "The bank always knows your account number. Nothing here changes that.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = TextPrimary
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "What GhostBank does is make the trail unlinkable: each source account is touched once, " +
+                        "behind a browser grade fingerprint and a rotated exit, so a burst of tiny credits never " +
+                        "looks like one person with a script.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextDim
+                )
+                Spacer(Modifier.height(12.dp))
+                Panel(border = Amber) {
                     Text(
-                        "Your bank always knows your own account number. Every paisa that lands carries the payee digits to your bank, and the source bank always knows the account it debited.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.typography.bodyMedium.color
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "What GhostBank actually changes: the destination digits are masked behind virtual accounts, each account is hit from its own burned fingerprint, and the traffic comes out of a rotating exit so the trail never lines up. That is masking and unlinkability — not magic.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = TextDim
+                        "What it does NOT do: it does not steal. Legs are IMPS P2A calls against live bank hosts. " +
+                            "Where a real bank API is unreachable, the leg is marked SIMULATED and never counted as live.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Amber
                     )
                 }
             }
-
             1 -> {
-                Text("Pick your stealth level. You can move it later in Settings.", style = MaterialTheme.typography.bodyMedium, color = TextDim)
-                StealthLevel.values().forEach { option ->
-                    val selected = level == option.name
-                    Panel(border = if (selected) levelColor(option) else Hairline) {
-                        Column(Modifier.fillMaxWidth().clickableNoRipple { level = option.name }) {
-                            Text(option.name, style = MaterialTheme.typography.titleSmall, color = levelColor(option), fontWeight = FontWeight.Bold)
-                            Text(
-                                when (option) {
-                                    StealthLevel.STANDARD -> "Browser fingerprint, random pacing, proxy optional."
-                                    StealthLevel.DEEP -> "Adds proxy rotation, a fresh session per run, decoy browsing and velocity caps."
-                                    StealthLevel.GHOST -> "Everything below, and the proxy is mandatory — no exit means no traffic at all."
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextDim,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
+                Text("PICK YOUR STEALTH LEVEL", style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
+                Spacer(Modifier.height(12.dp))
+                StealthLevel.entries.forEach { level ->
+                    val desc = when (level) {
+                        StealthLevel.STANDARD -> "Browser fingerprint, random pacing. Proxy optional."
+                        StealthLevel.DEEP -> "Adds proxy rotation, ephemeral session per run, decoy browsing, velocity caps."
+                        StealthLevel.GHOST -> "Everything in Deep plus a MANDATORY exit. No exit, no traffic."
+                    }
+                    Panel(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                            .clickableNoRipple { vm.setLevel(level) },
+                        border = levelColor(level)
+                    ) {
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Pill(level.name, levelColor(level))
+                                Spacer(Modifier.width(8.dp))
+                                if (level == StealthLevel.DEEP) Text("recommended", style = MaterialTheme.typography.labelSmall, color = Cyan)
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            Text(desc, style = MaterialTheme.typography.bodySmall, color = TextDim)
                         }
                     }
                 }
             }
-
             else -> {
-                Text("Where should the money land? This is the fixed destination for every leg.", style = MaterialTheme.typography.bodyMedium, color = TextDim)
-                TerminalField("ACCOUNT NUMBER", number, { number = it.filter { c -> c.isLetterOrDigit() }.take(18) }, numeric = true)
-                TerminalField("IFSC", ifsc, { ifsc = it.uppercase().filter { c -> c.isLetterOrDigit() }.take(11) }, error = hint)
+                Text("YOUR DESTINATION ACCOUNT", style = MaterialTheme.typography.headlineSmall, color = TextPrimary)
+                Spacer(Modifier.height(6.dp))
                 Text(
-                    BranchResolver.resolve(ifsc)?.let { "${it.bankName} · ${it.branchLabel}" } ?: "branch resolves once the IFSC is valid",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Cyan
+                    "Every leg lands here. One active destination, editable later from Banks.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextDim
                 )
-                TerminalField("ACCOUNT HOLDER NAME", holder, { holder = it.take(40) })
-                if (error != null) Text(error!!, style = MaterialTheme.typography.bodySmall, color = Red)
+                Spacer(Modifier.height(12.dp))
+                TerminalField(
+                    label = "account number",
+                    value = vm.number,
+                    onChange = { vm.number = it.filter { c -> c.isDigit() } },
+                    placeholder = "e.g. 50100234987121",
+                    numeric = true
+                )
+                Spacer(Modifier.height(10.dp))
+                TerminalField(
+                    label = "IFSC",
+                    value = vm.ifsc,
+                    onChange = { vm.ifsc = it.uppercase().take(11) },
+                    placeholder = "HDFC0000123",
+                    error = vm.error ?: BranchResolver.formatHint(vm.ifsc)
+                )
+                val resolved = BranchResolver.resolve(vm.ifsc)
+                if (resolved != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("resolved: ${resolved.bankName} — ${resolved.branchLabel}", style = MaterialTheme.typography.bodySmall, color = Green)
+                }
             }
         }
 
-        Spacer(Modifier.height(4.dp))
-        Column {
-            if (page < 2) {
-                TerminalButton(if (page == 0) "continue" else "next", { page += 1 })
-                Spacer(Modifier.height(8.dp))
-            }
-            if (page == 2) {
-                TerminalButton(if (busy) "saving…" else "save destination and enter", { finish(true) }, enabled = !busy)
-                Spacer(Modifier.height(8.dp))
-            }
+        Spacer(Modifier.height(24.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             if (page > 0) {
-                TerminalButton("back", { page -= 1 }, color = TextDim)
-                Spacer(Modifier.height(8.dp))
+                TerminalButton("BACK", { page-- }, color = TextDim, modifier = Modifier.weight(1f))
             }
-            TerminalButton("skip — set up later", { finish(page == 2) }, color = TextDim, enabled = !busy)
+            if (page < 2) {
+                TerminalButton("NEXT", { page++ }, modifier = Modifier.weight(1f))
+            } else {
+                TerminalButton("SAVE & ENTER", { vm.save(onDone) }, modifier = Modifier.weight(1f))
+            }
         }
-        EmptyState("GhostBank only talks to the banks. No analytics, no cloud.", null, null)
-        Pill("no app signature is ever sent", Green)
+        if (page == 2) {
+            Spacer(Modifier.height(10.dp))
+            TerminalButton("skip for now", { confirmSkip = true }, color = Amber, modifier = Modifier.fillMaxWidth())
+        }
+        Spacer(Modifier.height(30.dp))
+    }
+
+    if (confirmSkip) {
+        ConfirmDialog(
+            title = "Enter without a destination?",
+            body = "You can still browse banks and the ledger, but no leg can be booked until an account is saved.",
+            confirm = "enter anyway",
+            onConfirm = { vm.finishWithoutAccount(); onDone() },
+            onDismiss = { confirmSkip = false }
+        )
     }
 }
