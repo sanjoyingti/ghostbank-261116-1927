@@ -1,3 +1,4 @@
+=== ABOUT: Fixed the missing app name text so the launcher label and manifest resolve ===
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">GhostBank</string>

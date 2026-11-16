@@ -1,46 +1,41 @@
+=== ABOUT: Fixed the missing bank picker: 27 banks grouped, each with its cap, IMPS flag and rail quirk, showing your saved destination ===
 package com.arin.ghostbank.ui.screens
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.arin.ghostbank.AppContainer
+import com.arin.ghostbank.data.Settings
 import com.arin.ghostbank.model.Bank
 import com.arin.ghostbank.model.BankGroup
 import com.arin.ghostbank.model.Banks
 import com.arin.ghostbank.model.Ids
-import com.arin.ghostbank.ui.components.EmptyState
+import com.arin.ghostbank.ui.components.KeyValue
 import com.arin.ghostbank.ui.components.Panel
 import com.arin.ghostbank.ui.components.Pill
 import com.arin.ghostbank.ui.components.ScreenColumn
 import com.arin.ghostbank.ui.components.SectionTitle
+import com.arin.ghostbank.ui.components.TerminalButton
 import com.arin.ghostbank.ui.components.clickableNoRipple
-import com.arin.ghostbank.ui.components.paiseToRupees
+import com.arin.ghostbank.ui.components.paiseToCompact
 import com.arin.ghostbank.ui.theme.Amber
 import com.arin.ghostbank.ui.theme.Cyan
 import com.arin.ghostbank.ui.theme.Green
 import com.arin.ghostbank.ui.theme.Hairline
-import com.arin.ghostbank.ui.theme.InkCard
 import com.arin.ghostbank.ui.theme.Red
 import com.arin.ghostbank.ui.theme.TextDim
-import com.arin.ghostbank.ui.theme.TextPrimary
-import com.arin.ghostbank.ui.vm.BanksViewModel
 
 @Composable
 fun BanksScreen(
@@ -49,89 +44,75 @@ fun BanksScreen(
     onDestination: () -> Unit,
     onSettings: () -> Unit
 ) {
-    val vm: BanksViewModel = viewModel(factory = BanksViewModel.factory(container))
-    val destination by vm.destination.collectAsStateWithLifecycle()
+    val destination by container.accounts.destination().collectAsStateWithLifecycle(initialValue = null)
+    val registryCount by container.registry.count().collectAsStateWithLifecycle(initialValue = 0)
+    val settings by container.settings.flow.collectAsStateWithLifecycle(initialValue = Settings())
 
     ScreenColumn {
         val dest = destination
-        if (dest == null) {
-            Panel(border = Amber) {
-                Column {
-                    Text("no destination account", style = MaterialTheme.typography.titleSmall, color = Amber)
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "Every leg credits your account. Save it once and it is masked to the last four digits.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextDim
-                    )
+        Panel(border = if (dest == null) Amber else Green) {
+            Column {
+                Text("DESTINATION ACCOUNT", style = MaterialTheme.typography.labelSmall, color = if (dest == null) Amber else Green)
+                Spacer(Modifier.height(6.dp))
+                if (dest == null) {
+                    Text("No account saved. Every leg needs a fixed destination before anything can run.", style = MaterialTheme.typography.bodySmall, color = TextDim)
                     Spacer(Modifier.height(8.dp))
-                    Text("SET DESTINATION →", style = MaterialTheme.typography.labelLarge, color = Amber,
-                        modifier = Modifier.clickableNoRipple(onDestination))
-                }
-            }
-        } else {
-            Panel(border = Green) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("DESTINATION LOCKED", style = MaterialTheme.typography.labelSmall, color = Green)
-                        Text(
-                            Ids.maskNumber(dest.number) + " · " + dest.ifsc,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary
-                        )
-                        Text(dest.holderName ?: "unnamed", style = MaterialTheme.typography.bodySmall, color = TextDim)
-                    }
-                    Text("EDIT", style = MaterialTheme.typography.labelLarge, color = Cyan,
-                        modifier = Modifier.clickableNoRipple(onDestination))
+                    TerminalButton("set destination", onDestination, color = Amber)
+                } else {
+                    Text("${Ids.maskNumber(dest.number)}  ·  ${dest.ifsc}", style = MaterialTheme.typography.titleSmall, color = Green)
+                    Text(dest.holderName ?: "name not recorded", style = MaterialTheme.typography.bodySmall, color = TextDim)
+                    Spacer(Modifier.height(8.dp))
+                    TerminalButton("change destination", onDestination, color = TextDim)
                 }
             }
         }
 
-        SectionTitle("pick a target", "each bank shows its own per-transaction cap, IMPS support and rail quirk")
+        KeyValue("stealth level", settings.stealthLevel.name, Green)
+        KeyValue("dedupe registry", "$registryCount hashed accounts", Cyan)
+        KeyValue("exit", if (settings.torMode) "Tor (127.0.0.1:9050)" else (settings.lastExitIp ?: "direct / none"), TextDim)
 
+        SectionTitle("Targets", "27 banks. Tap one to open its transfer or harvest screen.")
         BankGroup.values().forEach { group ->
             Text(
                 when (group) {
-                    BankGroup.PUBLIC -> "// public sector"
-                    BankGroup.PRIVATE -> "// private"
-                    BankGroup.SFB -> "// small finance"
+                    BankGroup.PUBLIC -> "// PUBLIC SECTOR"
+                    BankGroup.PRIVATE -> "// PRIVATE"
+                    BankGroup.SFB -> "// SMALL FINANCE BANKS"
                 },
                 style = MaterialTheme.typography.labelSmall,
-                color = Cyan
+                color = TextDim,
+                modifier = Modifier.padding(top = 8.dp, bottom = 2.dp)
             )
-            Banks.all.filter { it.group == group }.forEach { bank ->
-                BankRow(bank) { onBank(bank.code) }
-            }
+            Banks.all.filter { it.group == group }.forEach { bank -> BankRow(bank) { onBank(bank.code) } }
         }
 
-        if (Banks.all.isEmpty()) {
-            EmptyState("no banks loaded", "open settings", onSettings)
-        }
-        Text("caps are shown in rupees; all amounts are held internally in paise", style = MaterialTheme.typography.labelSmall, color = TextDim)
+        TerminalButton("settings", onSettings, color = TextDim)
     }
 }
 
 @Composable
 private fun BankRow(bank: Bank, onClick: () -> Unit) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .background(InkCard)
-            .border(1.dp, Hairline, RoundedCornerShape(6.dp))
-            .clickableNoRipple(onClick)
-            .padding(12.dp)
-    ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text(bank.name, style = MaterialTheme.typography.titleSmall, color = TextPrimary, modifier = Modifier.weight(1f))
-            Pill(bank.code, Cyan)
+    Panel(border = Hairline) {
+        Column(Modifier.fillMaxWidth().clickableNoRipple(onClick)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(bank.name, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.typography.titleSmall.color)
+                Spacer(Modifier.width(8.dp))
+                Pill(bank.code, Cyan)
+            }
+            Spacer(Modifier.height(4.dp))
+            Row {
+                Text("cap ${paiseToCompact(bank.capPaise)}", style = MaterialTheme.typography.labelSmall, color = Amber)
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    if (bank.impsSupported) "IMPS P2A 24x7" else "IMPS unavailable",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (bank.impsSupported) Green else Red
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(bank.country, style = MaterialTheme.typography.labelSmall, color = TextDim)
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(bank.quirk, style = MaterialTheme.typography.bodySmall, color = TextDim)
         }
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Pill("CAP " + paiseToRupees(bank.capPaise), Amber)
-            Pill(if (bank.impsSupported) "IMPS 24x7" else "IMPS unavailable", if (bank.impsSupported) Green else Red)
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(bank.quirk, style = MaterialTheme.typography.bodySmall, color = TextDim)
     }
 }

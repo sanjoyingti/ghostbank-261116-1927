@@ -1,61 +1,162 @@
+=== ABOUT: Fixed the missing transfer screen: amount, source, one big run button, the seven stages with confirmations, timings and raw responses ===
 package com.arin.ghostbank.ui.screens
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.ghostbank.AppContainer
+import com.arin.ghostbank.data.Settings
+import com.arin.ghostbank.data.db.RunEntity
 import com.arin.ghostbank.data.db.StageLogEntity
-import com.arin.ghostbank.model.Badge
+import com.arin.ghostbank.model.Bank
+import com.arin.ghostbank.model.Banks
 import com.arin.ghostbank.model.REMITTER_PROFILES
+import com.arin.ghostbank.model.RunMode
 import com.arin.ghostbank.model.RunStatus
 import com.arin.ghostbank.model.StageKind
-import com.arin.ghostbank.ui.components.BadgeChip
 import com.arin.ghostbank.ui.components.BackBar
-import com.arin.ghostbank.ui.components.ConfirmDialog
 import com.arin.ghostbank.ui.components.EmptyState
 import com.arin.ghostbank.ui.components.KeyValue
 import com.arin.ghostbank.ui.components.Meter
 import com.arin.ghostbank.ui.components.Panel
 import com.arin.ghostbank.ui.components.Pill
-import com.arin.ghostbank.ui.components.ScoreChip
 import com.arin.ghostbank.ui.components.ScreenColumn
+import com.arin.ghostbank.ui.components.SectionTitle
 import com.arin.ghostbank.ui.components.TerminalButton
 import com.arin.ghostbank.ui.components.TerminalField
 import com.arin.ghostbank.ui.components.clickableNoRipple
-import com.arin.ghostbank.ui.components.paiseToRupees
-import com.arin.ghostbank.ui.components.rememberKey
-import com.arin.ghostbank.ui.components.stamp
+import com.arin.ghostbank.ui.components.paiseToCompact
+import com.arin.ghostbank.ui.components.rupeesToPaise
 import com.arin.ghostbank.ui.theme.Amber
 import com.arin.ghostbank.ui.theme.Cyan
 import com.arin.ghostbank.ui.theme.Green
 import com.arin.ghostbank.ui.theme.Hairline
-import com.arin.ghostbank.ui.theme.InkCard
 import com.arin.ghostbank.ui.theme.Red
 import com.arin.ghostbank.ui.theme.TextDim
-import com.arin.ghostbank.ui.theme.TextPrimary
-import com.arin.ghostbank.ui.vm.TransferViewModel
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class TransferViewModel(private val container: AppContainer, private val bank: Bank) : ViewModel() {
+
+    data class Ui(
+        val amount: String = "1",
+        val harvest: Boolean = true,
+        val sourceIndex: Int = 0,
+        val busy: Boolean = false,
+        val problem: String? = null
+    )
+
+    private val _ui = MutableStateFlow(Ui())
+    val state: StateFlow<Ui> = _ui
+    private val runId = MutableStateFlow<Long?>(null)
+    private var job: Job? = null
+
+    val run: StateFlow<RunEntity?> = runId
+        .flatMapLatest { id -> if (id == null) flowOf(null) else container.runs.byId(id) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    val logs: StateFlow<List<StageLogEntity>> = runId
+        .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else container.runs.logs(id) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun setAmount(value: String) {
+        _ui.value = _ui.value.copy(amount = value.filter { it.isDigit() || it == '.' }.take(10), problem = null)
+    }
+
+    fun setHarvest(on: Boolean) = _ui.value = _ui.value.copy(harvest = on)
+    fun setSource(index: Int) = _ui.value = _ui.value.copy(sourceIndex = index)
+
+    private fun amountPaise(): Long? {
+        val ui = _ui.value
+        if (ui.harvest) return 1L
+        val paise = rupeesToPaise(ui.amount) ?: return null
+        if (paise < 100) return null
+        if (paise > bank.capPaise) return null
+        return paise
+    }
+
+    fun run() {
+        val ui = _ui.value
+        val paise = amountPaise()
+        val problem = when {
+            paise == null && ui.harvest -> "amount must be ₹1 or more"
+            paise == null -> "amount must be between ₹1 and ${paiseToCompact(bank.capPaise)}"
+            else -> null
+        }
+        if (problem != null) {
+            _ui.value = ui.copy(problem = problem)
+            return
+        }
+        val source = REMITTER_PROFILES[ui.sourceIndex.coerceIn(0, REMITTER_PROFILES.lastIndex)]
+        _ui.value = ui.copy(busy = true, problem = null)
+        job?.cancel()
+        job = viewModelScope.launch {
+            val settings = container.settings.flow.first()
+            val id = container.engine.createTransferRun(
+                bank = bank,
+                amountPaise = paise!!,
+                mode = if (ui.harvest) RunMode.HARVEST else RunMode.TRANSFER,
+                level = settings.stealthLevel
+            )
+            runId.value = id
+            container.engine.performTransferRun(id, settings, source)
+            _ui.value = _ui.value.copy(busy = false)
+        }
+    }
+
+    fun cancel() {
+        val id = runId.value ?: return
+        viewModelScope.launch { container.engine.cancel(id); _ui.value = _ui.value.copy(busy = false) }
+    }
+
+    fun retry() {
+        val id = runId.value ?: return
+        val source = REMITTER_PROFILES[_ui.value.sourceIndex.coerceIn(0, REMITTER_PROFILES.lastIndex)]
+        _ui.value = _ui.value.copy(busy = true)
+        job?.cancel()
+        job = viewModelScope.launch {
+            val settings = container.settings.flow.first()
+            container.engine.retryTransfer(id, settings, source)
+            _ui.value = _ui.value.copy(busy = false)
+        }
+    }
+
+    companion object {
+        fun factory(container: AppContainer, bank: Bank): ViewModelProvider.Factory = viewModelFactory {
+            initializer { TransferViewModel(container, bank) }
+        }
+    }
+}
 
 @Composable
 fun TransferScreen(
@@ -66,279 +167,127 @@ fun TransferScreen(
     onConsole: (Long) -> Unit,
     onTrace: (Long) -> Unit
 ) {
-    val vm: TransferViewModel = viewModel(factory = TransferViewModel.factory(container, bankCode))
+    val bank = Banks.byCode(bankCode)
+    if (bank == null) {
+        ScreenColumn {
+            BackBar("Unknown bank", null, onBack)
+            EmptyState("That bank code is not in the 27 — go back and pick one", "back", onBack)
+        }
+        return
+    }
+    val vm: TransferViewModel = viewModel(factory = TransferViewModel.factory(container, bank))
     val state by vm.state.collectAsStateWithLifecycle()
-    val bank = vm.bank
-
-    var confirmCancel by remember { mutableStateOf(false) }
-    var confirmRun by remember { mutableStateOf(false) }
+    val run by vm.run.collectAsStateWithLifecycle()
+    val logs by vm.logs.collectAsStateWithLifecycle()
+    val destination by container.accounts.destination().collectAsStateWithLifecycle(initialValue = null)
+    val settings by container.settings.flow.collectAsStateWithLifecycle(initialValue = Settings())
+    var openStage by remember { mutableStateOf<String?>(null) }
 
     ScreenColumn {
-        BackBar(bank?.name ?: bankCode, bank?.quirk ?: "unknown bank", onBack)
-
-        if (bank == null) {
-            EmptyState("no such bank", "back", onBack)
-            return@ScreenColumn
-        }
-
-        if (state.destinationMissing) {
-            Panel(border = Amber) {
-                Column {
-                    Text("no destination saved", style = MaterialTheme.typography.titleSmall, color = Amber)
-                    Text("Set the account the money should land in first.", style = MaterialTheme.typography.bodySmall, color = TextDim)
-                    Spacer(Modifier.height(8.dp))
-                    Text("SET DESTINATION →", style = MaterialTheme.typography.labelLarge, color = Amber,
-                        modifier = Modifier.clickableNoRipple(onDestination))
+        BackBar(bank.name, "${bank.group.name} · cap ${paiseToCompact(bank.capPaise)}", onBack)
+        Panel(border = Amber) {
+            Column {
+                Text("RAIL QUIRK", style = MaterialTheme.typography.labelSmall, color = Amber)
+                Text(bank.quirk, style = MaterialTheme.typography.bodySmall, color = TextDim)
+                Spacer(Modifier.height(4.dp))
+                Row {
+                    Pill(if (bank.impsSupported) "IMPS P2A" else "NO IMPS", if (bank.impsSupported) Green else Red)
+                    Spacer(Modifier.width(6.dp))
+                    Pill("24x7 real time", Cyan)
                 }
             }
-        } else {
-            Text(state.destinationLabel.orEmpty(), style = MaterialTheme.typography.bodySmall, color = Green)
         }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Pill("CAP " + paiseToRupees(bank.capPaise), Amber)
-            Pill("IMPS P2A 24x7", Green)
+        if (destination == null) {
+            Panel(border = Red) {
+                Column {
+                    Text("No destination saved — nothing can be credited", style = MaterialTheme.typography.bodySmall, color = Red)
+                    Spacer(Modifier.height(6.dp))
+                    TerminalButton("set destination", onDestination, color = Amber)
+                }
+            }
         }
 
-        TerminalField(
-            label = "AMOUNT (₹)",
-            value = state.amountText,
-            onChange = vm::setAmount,
-            placeholder = "1 to " + paiseToRupees(bank.capPaise),
-            error = state.error,
-            numeric = true,
-            enabled = !state.running
+        KeyValue("velocity cap", "${settings.maxRequestsPerMinute} req/min", Cyan)
+        KeyValue("entropy budget", "${settings.entropyBudget} requests this run", Cyan)
+        KeyValue("stealth", "${settings.stealthLevel.name}${if (settings.torMode) " · Tor" else ""}", Green)
+
+        TerminalButton(
+            if (state.harvest) "harvest mode: amount locked to ₹0.01" else "manual amount",
+            { vm.setHarvest(!state.harvest) },
+            color = if (state.harvest) Green else TextDim
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TerminalButton("harvest ₹0.01", vm::fillHarvestFloor, enabled = !state.running, color = Cyan, modifier = Modifier.weight(1f))
-            TerminalButton("max", {
-                vm.setAmount((bank.capPaise / 100).toString())
-            }, enabled = !state.running, color = TextDim, modifier = Modifier.weight(1f))
+        if (!state.harvest) {
+            TerminalField("AMOUNT (₹)", state.amount, vm::setAmount, numeric = true, error = state.problem)
         }
 
-        Text("source", style = MaterialTheme.typography.labelSmall, color = TextDim)
+        SectionTitle("Source", "a saved remitter profile, or the bank's own P2A route")
         REMITTER_PROFILES.forEachIndexed { index, profile ->
             val selected = state.sourceIndex == index
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(5.dp))
-                    .background(InkCard)
-                    .border(1.dp, if (selected) Green else Hairline, RoundedCornerShape(5.dp))
-                    .clickableNoRipple { vm.setSource(index) }
-                    .padding(10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(profile.name, style = MaterialTheme.typography.bodySmall, color = if (selected) TextPrimary else TextDim)
-                if (selected) Text("ARMED", style = MaterialTheme.typography.labelSmall, color = Green)
+            Panel(border = if (selected) Green else Hairline) {
+                Column(Modifier.fillMaxWidth().clickableNoRipple { vm.setSource(index) }) {
+                    Text(profile.name, style = MaterialTheme.typography.bodyMedium, color = if (selected) Green else MaterialTheme.typography.bodyMedium.color)
+                    Text("${profile.accountNumber} · ${profile.ifsc}", style = MaterialTheme.typography.labelSmall, color = TextDim)
+                }
             }
         }
 
-        if (state.running) {
-            TerminalButton("RUN IN FLIGHT", {}, enabled = false, modifier = Modifier.fillMaxWidth())
-        } else {
-            TerminalButton(if (state.activeRunId == null) "RUN" else "RUN AGAIN", { confirmRun = true }, modifier = Modifier.fillMaxWidth())
-        }
-
-        val runId = state.activeRunId
-        if (runId != null) {
-            RunPanel(
-                container = container,
-                runId = runId,
-                running = state.running,
-                expanded = state.expanded,
-                onToggle = vm::toggleExpanded,
-                onCancel = { confirmCancel = true },
-                onRetry = vm::retry,
-                onConsole = { onConsole(runId) },
-                onTrace = { onTrace(runId) }
-            )
-        } else {
-            EmptyState("nothing sent yet", null)
-        }
-
-        Text(
-            "A stage never advances without a server confirmation. The idempotency key is fixed per run, so a retry can never double-debit.",
-            style = MaterialTheme.typography.labelSmall,
-            color = TextDim
+        TerminalButton(
+            if (state.busy) "running…" else if (state.harvest) "RUN HARVEST LEG" else "RUN TRANSFER",
+            vm::run,
+            enabled = !state.busy && destination != null
         )
-    }
+        if (state.busy) TerminalButton("cancel run", vm::cancel, color = Red)
 
-    if (confirmRun) {
-        ConfirmDialog(
-            title = "send the run?",
-            body = "The seven stages will fire against ${bank.name}. Velocity caps and the entropy budget apply.",
-            confirm = "run",
-            onConfirm = vm::start,
-            onDismiss = { confirmRun = false }
-        )
-    }
-    if (confirmCancel) {
-        ConfirmDialog(
-            title = "cancel the run?",
-            body = "The run stops at its last confirmed stage and stays in the ledger. Nothing is silently dropped.",
-            confirm = "cancel run",
-            onConfirm = vm::cancel,
-            onDismiss = { confirmCancel = false }
-        )
-    }
-}
-
-@Composable
-private fun RunPanel(
-    container: AppContainer,
-    runId: Long,
-    running: Boolean,
-    expanded: Set<Long>,
-    onToggle: (Long) -> Unit,
-    onCancel: () -> Unit,
-    onRetry: () -> Unit,
-    onConsole: () -> Unit,
-    onTrace: () -> Unit
-) {
-    val runFlow = remember(runId) { container.runs.byId(runId) }
-    val run by runFlow.collectAsState(initial = null)
-    val logsFlow = remember(runId) { container.runs.logs(runId) }
-    val logs by logsFlow.collectAsState(initial = emptyList<StageLogEntity>())
-    val scoreFlow = remember(runId) { container.db.scores().byRun(runId) }
-    val score by scoreFlow.collectAsState(initial = null)
-
-    val status = run?.status ?: RunStatus.RUNNING.name
-    val idempotency = run?.idempotencyKey.orEmpty()
-
-    Panel(border = when (status) {
-        RunStatus.COMPLETED.name -> Green
-        RunStatus.FAILED.name, RunStatus.CANCELLED.name -> Red
-        RunStatus.PAUSED.name -> Amber
-        else -> Hairline
-    }) {
-        Column {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("run #$runId", style = MaterialTheme.typography.titleSmall, color = TextPrimary)
-                PILL_STATUS(status)
+        run?.let { current ->
+            KeyValue("idempotency key", current.idempotencyKey, Cyan)
+            KeyValue("status", current.status, if (current.status == RunStatus.COMPLETED.name) Green else Amber)
+            current.errorText?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Red) }
+            current.summary?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextDim) }
+            Row {
+                TerminalButton("raw console", { onConsole(current.id) }, color = Cyan)
+                Spacer(Modifier.width(8.dp))
+                TerminalButton("trace audit", { onTrace(current.id) }, color = TextDim)
             }
-            Spacer(Modifier.height(6.dp))
-            KeyValue("idempotency", idempotency.take(18) + "…")
-            KeyValue("amount", paiseToRupees(run?.amountPaise ?: 0L))
-            KeyValue("exit", (run?.exitIp ?: "unknown") + " / " + (run?.exitCountry ?: "??"))
-            KeyValue("last confirmed", run?.lastConfirmedStage ?: "none")
-            Spacer(Modifier.height(8.dp))
+            if (current.status == RunStatus.FAILED.name || current.status == RunStatus.PAUSED.name) {
+                TerminalButton("retry with the same key", vm::retry, color = Amber, enabled = !state.busy)
+            }
+        }
 
-            StageKind.values().forEach { kind ->
-                val latest = logs.lastOrNull { it.stage == kind.name }
-                val colour = when {
-                    latest == null -> TextDim
-                    latest.httpStatus != null && latest.httpStatus!! in 200..399 -> Green
-                    else -> Red
-                }
-                val mark = when {
-                    latest == null -> "·"
-                    latest.httpStatus != null && latest.httpStatus!! in 200..399 -> "✓"
-                    else -> "✕"
-                }
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .clickableNoRipple { latest?.let { onToggle(it.id) } }
-                        .padding(vertical = 4.dp)
-                ) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(mark + " ", style = MaterialTheme.typography.bodyMedium, color = colour)
-                            Text(kind.name, style = MaterialTheme.typography.bodySmall, color = colour)
-                        }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (latest?.latencyMs != null) {
-                                Text(latest!!.latencyMs.toString() + "ms ", style = MaterialTheme.typography.labelSmall, color = TextDim)
-                            }
-                            if (latest?.httpStatus != null) {
-                                Text("HTTP " + latest!!.httpStatus, style = MaterialTheme.typography.labelSmall, color = colour)
-                            }
-                            if (latest != null) {
-                                Spacer(Modifier.height(2.dp))
-                                Text(if (latest!!.badge == Badge.LIVE.name) " LIVE" else " SIMULATED",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (latest!!.badge == Badge.LIVE.name) Green else Amber)
-                            }
-                        }
+        SectionTitle("Pipeline", "a stage only ticks on a server confirmation")
+        StageKind.values().forEach { stage ->
+            val last = logs.lastOrNull { it.stage == stage.name }
+            val statusColor = when {
+                last == null -> TextDim
+                last.httpStatus == null -> Amber
+                last.httpStatus!! in 200..399 -> Green
+                else -> Red
+            }
+            Panel(border = if (last == null) Hairline else statusColor) {
+                Column(Modifier.fillMaxWidth().clickableNoRipple { openStage = if (openStage == stage.name) null else stage.name }) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(if (last != null) "[x]" else "[ ]", style = MaterialTheme.typography.titleSmall, color = statusColor)
+                        Spacer(Modifier.width(8.dp))
+                        Text(stage.name, style = MaterialTheme.typography.titleSmall, color = if (last == null) TextDim else MaterialTheme.typography.titleSmall.color)
+                        Spacer(Modifier.width(8.dp))
+                        if (last != null) Pill("${last.latencyMs ?: 0}ms", statusColor)
                     }
-                    val entry = latest
-                    if (entry != null && expanded.contains(entry.id)) {
-                        Column(
-                            Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(4.dp))
-                                .background(com.arin.ghostbank.ui.theme.Ink)
-                                .padding(8.dp)
-                        ) {
-                            Text(entry.note ?: entry.stage, style = MaterialTheme.typography.labelSmall, color = TextDim)
-                            if (entry.requestHeaders != null) {
-                                Text("→ request", style = MaterialTheme.typography.labelSmall, color = Cyan)
-                                Text(entry.requestHeaders, style = MaterialTheme.typography.bodySmall, color = TextDim)
-                            }
-                            if (entry.responseHeaders != null) {
-                                Text("← response headers", style = MaterialTheme.typography.labelSmall, color = Cyan)
-                                Text(entry.responseHeaders, style = MaterialTheme.typography.bodySmall, color = TextDim)
-                            }
-                            if (entry.rawBody != null) {
-                                Text("raw body", style = MaterialTheme.typography.labelSmall, color = Cyan)
-                                Text(entry.rawBody.take(1200), style = MaterialTheme.typography.bodySmall, color = TextPrimary)
-                            }
-                        }
+                    Text(
+                        last?.note ?: last?.let { "HTTP ${it.httpStatus ?: "-"} · ${it.badge}" } ?: "waiting for a confirmed response",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextDim
+                    )
+                    if (openStage == stage.name) {
+                        Text(last?.requestHeaders ?: "no request recorded", style = MaterialTheme.typography.bodySmall, color = Cyan)
+                        Text(last?.responseHeaders ?: "no response headers", style = MaterialTheme.typography.bodySmall, color = TextDim)
+                        Text(last?.rawBody?.take(600) ?: "no body", style = MaterialTheme.typography.bodySmall, color = TextDim)
                     }
                 }
             }
-
-            Spacer(Modifier.height(8.dp))
-            val effectiveScore = score?.score ?: run?.stealthScore ?: 0
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                ScoreChip(effectiveScore)
-                Text("score gauge", style = MaterialTheme.typography.labelSmall, color = TextDim)
-            }
-            Spacer(Modifier.height(4.dp))
-            Meter(effectiveScore / 100f, if (effectiveScore >= 80) Green else if (effectiveScore >= 50) Amber else Red)
-            score?.reasons?.split("\n")?.filter { it.isNotBlank() }?.forEach {
-                Text(it, style = MaterialTheme.typography.labelSmall, color = TextDim)
-            }
-
-            Spacer(Modifier.height(8.dp))
-            if (run?.errorText != null) {
-                Panel(border = Red) {
-                    Column {
-                        Text(run!!.errorKind ?: "ERROR", style = MaterialTheme.typography.labelSmall, color = Red)
-                        Text(run!!.errorText!!, style = MaterialTheme.typography.bodySmall, color = TextPrimary)
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-            }
-            if (run?.summary != null) {
-                Text(run!!.summary!!, style = MaterialTheme.typography.bodySmall, color = TextDim)
-                Spacer(Modifier.height(8.dp))
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (running) {
-                    TerminalButton("CANCEL", onCancel, color = Red, modifier = Modifier.weight(1f))
-                } else {
-                    TerminalButton("RETRY (same key)", onRetry, color = Amber, modifier = Modifier.weight(1f))
-                }
-                TerminalButton("RAW", onConsole, color = Cyan, modifier = Modifier.weight(1f))
-                TerminalButton("TRACE", onTrace, color = TextDim, modifier = Modifier.weight(1f))
-            }
-            Spacer(Modifier.height(4.dp))
-            Text("started " + stamp(run?.startedAt ?: 0L), style = MaterialTheme.typography.labelSmall, color = TextDim)
         }
-    }
-}
 
-@Composable
-private fun PILL_STATUS(status: String) {
-    val colour = when (status) {
-        RunStatus.COMPLETED.name -> Green
-        RunStatus.FAILED.name, RunStatus.CANCELLED.name -> Red
-        RunStatus.PAUSED.name -> Amber
-        else -> Cyan
+        val confirmed = logs.count { it.httpStatus != null && it.httpStatus!! in 200..399 }
+        Meter(confirmed / 7f, Green)
+        Text("$confirmed of 7 stages confirmed · ${settings.entropyBudget} request budget", style = MaterialTheme.typography.labelSmall, color = TextDim)
     }
-    Pill(status, colour)
 }
