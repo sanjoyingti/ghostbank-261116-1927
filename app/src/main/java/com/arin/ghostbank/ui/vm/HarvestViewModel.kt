@@ -6,260 +6,207 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.ghostbank.AppContainer
-import com.arin.ghostbank.data.Settings
 import com.arin.ghostbank.data.db.HarvestLegEntity
-import com.arin.ghostbank.data.db.RunEntity
-import com.arin.ghostbank.data.net.LeakState
 import com.arin.ghostbank.model.Banks
-import com.arin.ghostbank.model.ErrorKind
-import com.arin.ghostbank.model.GhostError
 import com.arin.ghostbank.model.HarvestStatus
 import com.arin.ghostbank.model.Ids
 import com.arin.ghostbank.model.RunMode
 import com.arin.ghostbank.model.RunStatus
-import com.arin.ghostbank.model.StealthLevel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-@OptIn(ExperimentalCoroutinesApi::class)
+data class PreflightRow(
+    val number: String,
+    val ifsc: String,
+    val problem: String?,
+    val known: Boolean
+) {
+    val key: String get() = "$number|$ifsc"
+    val usable: Boolean get() = problem == null && !known
+}
+
+data class HarvestState(
+    val bankCode: String = "SBI",
+    val pasteText: String = "",
+    val singleNumber: String = "",
+    val singleIfsc: String = "",
+    val rows: List<PreflightRow> = emptyList(),
+    val error: String? = null,
+    val activeRunId: Long? = null,
+    val running: Boolean = false,
+    val pauseDialog: Boolean = false,
+    val pauseReason: String? = null
+)
+
 class HarvestViewModel(private val container: AppContainer) : ViewModel() {
 
-    data class Candidate(
-        val number: String,
-        val ifsc: String,
-        val problem: String?,
-        val alreadyHarvested: Boolean,
-        val existingStatus: String?
-    )
-
-    private val _bankCode = MutableStateFlow("SBI")
-    val bankCode: StateFlow<String> = _bankCode.asStateFlow()
-
-    private val _queue = MutableStateFlow<List<Candidate>>(emptyList())
-    val queue: StateFlow<List<Candidate>> = _queue.asStateFlow()
-
-    private val _runId = MutableStateFlow<Long?>(null)
-    val runId: StateFlow<Long?> = _runId.asStateFlow()
-
-    val legs: StateFlow<List<HarvestLegEntity>> = _runId
-        .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else container.runs.legs(id) }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-
-    val totalPaise: StateFlow<Long> = _runId
-        .flatMapLatest { id -> if (id == null) flowOf(0L) else container.db.legs().totalPaise(id).map { it ?: 0L } }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
-
-    val run: StateFlow<RunEntity?> = _runId
-        .flatMapLatest { id -> if (id == null) flowOf(null) else container.runs.byId(id) }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-
-    val settings: StateFlow<Settings> = container.settings.flow
-        .stateIn(viewModelScope, SharingStarted.Eagerly, Settings())
-
-    private val _running = MutableStateFlow(false)
-    val running: StateFlow<Boolean> = _running.asStateFlow()
-
-    private val _error = MutableStateFlow<GhostError?>(null)
-    val error: StateFlow<GhostError?> = _error.asStateFlow()
-
-    private val _message = MutableStateFlow<String?>(null)
-    val message: StateFlow<String?> = _message.asStateFlow()
-
-    private val _interrupted = MutableStateFlow<RunEntity?>(null)
-    val interrupted: StateFlow<RunEntity?> = _interrupted.asStateFlow()
-
-    private val _showCancel = MutableStateFlow(false)
-    val showCancel: StateFlow<Boolean> = _showCancel.asStateFlow()
+    private val _state = MutableStateFlow(HarvestState())
+    val state = _state.asStateFlow()
 
     init {
         viewModelScope.launch {
-            val open = container.runs.unfinished().firstOrNull { it.mode == RunMode.HARVEST.name }
-            _interrupted.value = open
-            if (open != null) _runId.value = open.id
-        }
-    }
-
-    private suspend fun validate(rawNumber: String, rawIfsc: String): Candidate {
-        val number = rawNumber.trim()
-        val ifsc = rawIfsc.trim().uppercase()
-        val problem = when {
-            !Regex("^\\d{9,18}$").matches(number) -> "account number must be 9–18 digits"
-            !Banks.isValidIfsc(ifsc) -> "IFSC shape wrong (4 letters, 0, 6 alnum)"
-            else -> null
-        }
-        val existing = if (problem == null) container.registry.byHash(Ids.sha256("$number|$ifsc")) else null
-        return Candidate(
-            number = number,
-            ifsc = ifsc,
-            problem = problem,
-            alreadyHarvested = existing != null && existing.status != HarvestStatus.PENDING.name,
-            existingStatus = existing?.status
-        )
-    }
-
-    fun addLines(text: String, fallbackIfsc: String) {
-        if (text.isBlank()) return
-        viewModelScope.launch {
-            val added = mutableListOf<Candidate>()
-            text.lines().map { it.trim() }.filter { it.isNotEmpty() }.forEach { line ->
-                val parts = line.split(",", "|", " ").map { it.trim() }.filter { it.isNotEmpty() }
-                val number = parts.getOrNull(0).orEmpty()
-                val ifsc = parts.getOrNull(1) ?: fallbackIfsc
-                val candidate = validate(number, ifsc)
-                if (_queue.value.none { it.number == candidate.number && it.ifsc == candidate.ifsc }) added += candidate
+            _state.map { it.activeRunId }.distinctUntilChanged().flatMapLatest { id ->
+                if (id == null) flowOf(null) else container.runs.byId(id)
+            }.collect { run ->
+                _state.update {
+                    it.copy(
+                        running = run?.status == RunStatus.RUNNING.name,
+                        pauseDialog = run?.status == RunStatus.PAUSED.name,
+                        pauseReason = if (run?.status == RunStatus.PAUSED.name) run.errorText else it.pauseReason
+                    )
+                }
             }
-            _queue.value = _queue.value + added
-            _message.value = if (added.isEmpty()) "nothing new in that text" else "${added.size} line(s) added to the pre-flight list"
         }
     }
 
-    fun removeAt(index: Int) {
-        _queue.value = _queue.value.filterIndexed { i, _ -> i != index }
-    }
+    fun setBank(code: String) = _state.update { it.copy(bankCode = code) }
+    fun setPaste(text: String) = _state.update { it.copy(pasteText = text) }
+    fun setSingleNumber(text: String) = _state.update { it.copy(singleNumber = text.filter { c -> c.isDigit() }.take(18)) }
+    fun setSingleIfsc(text: String) = _state.update { it.copy(singleIfsc = text.uppercase().filter { c -> c.isLetterOrDigit() }.take(11)) }
+    fun clearError() = _state.update { it.copy(error = null) }
+    fun dismissPause() = _state.update { it.copy(pauseDialog = false) }
 
-    fun clearQueue() { _queue.value = emptyList() }
-
-    fun setBank(code: String) { _bankCode.value = code }
-
-    fun askCancel() { _showCancel.value = true }
-    fun dismissCancel() { _showCancel.value = false }
-
-    fun start() {
-        if (_running.value) return
-        val fresh = _queue.value.filter { it.problem == null && !it.alreadyHarvested }
-        if (fresh.isEmpty()) {
-            _error.value = GhostError(ErrorKind.CONFIG, "Nothing in the queue can be sent.", "Add valid account numbers that are not already in the registry")
+    fun addPasted() {
+        val raw = _state.value.pasteText
+        if (raw.isBlank()) {
+            _state.update { it.copy(error = "Paste at least one line: account then IFSC") }
             return
         }
         viewModelScope.launch {
-            _running.value = true
-            _error.value = null
-            val current = settings.value
-            if (container.accounts.current() == null) {
-                _error.value = GhostError(ErrorKind.CONFIG, "No destination account saved.", "Save your account number and IFSC first")
-                _running.value = false
-                return@launch
-            }
-            if (current.stealthLevel == StealthLevel.GHOST && LeakState.passed != true) {
-                val report = container.leakLab.probe(current)
-                if (!report.passed) {
-                    _error.value = GhostError(
-                        ErrorKind.CONFIG,
-                        "Ghost level is on and the leak lab has not passed, so nothing was sent.",
-                        "Open the Shield tab, run the leak lab, then start the harvest",
-                        report.error
-                    )
-                    _running.value = false
-                    return@launch
+            val parsed = raw.lines().map { it.trim() }.filter { it.isNotEmpty() }.map { line ->
+                val parts = line.split(",", " ", "\t", ";", "|").filter { it.isNotBlank() }
+                val number = parts.getOrNull(0)?.filter { c -> c.isDigit() }.orEmpty()
+                val ifsc = parts.getOrNull(1)?.uppercase()?.filter { c -> c.isLetterOrDigit() }.orEmpty()
+                val problem = when {
+                    parts.size < 2 -> "no IFSC on this line"
+                    number.length < 9 -> "account number too short"
+                    !Banks.isValidIfsc(ifsc) -> "IFSC shape is wrong"
+                    else -> null
                 }
+                val hash = Ids.sha256("$number|$ifsc")
+                val known = problem == null && container.registry.byHash(hash) != null
+                PreflightRow(number = number, ifsc = ifsc, problem = problem, known = known)
             }
-            val bank = _bankCode.value
-            val ids = mutableListOf<Pair<Long, Pair<String, String>>>()
-            fresh.forEach { candidate ->
-                val id = container.registry.enqueue(candidate.number, candidate.ifsc, bank)
-                if (id != null) ids += id to (candidate.number to candidate.ifsc)
+            _state.update { current ->
+                val existing = current.rows.map { it.key }.toSet()
+                val merged = current.rows + parsed.filter { !existing.contains(it.key) }
+                current.copy(rows = merged, pasteText = "", error = null)
             }
-            if (ids.isEmpty()) {
-                _message.value = "every queued account is already in the registry"
-                _running.value = false
+        }
+    }
+
+    fun addSingle() {
+        val number = _state.value.singleNumber
+        val ifsc = _state.value.singleIfsc
+        val problem = when {
+            number.length < 9 -> "account number too short"
+            !Banks.isValidIfsc(ifsc) -> "IFSC shape is wrong"
+            else -> null
+        }
+        viewModelScope.launch {
+            val hash = Ids.sha256("$number|$ifsc")
+            val known = problem == null && container.registry.byHash(hash) != null
+            val row = PreflightRow(number = number, ifsc = ifsc, problem = problem, known = known)
+            _state.update { current ->
+                if (current.rows.any { it.key == row.key }) current
+                else current.copy(rows = current.rows + row, singleNumber = "", singleIfsc = "", error = null)
+            }
+        }
+    }
+
+    fun removeRow(key: String) = _state.update { current ->
+        current.copy(rows = current.rows.filter { it.key != key })
+    }
+
+    fun clearRows() = _state.update { it.copy(rows = emptyList()) }
+
+    fun start() {
+        val usable = _state.value.rows.filter { it.usable }
+        if (usable.isEmpty()) {
+            _state.update { it.copy(error = "Nothing new in the queue — every account is either invalid or already harvested") }
+            return
+        }
+        viewModelScope.launch {
+            val settings = container.settings.flow.first()
+            val claimed = mutableListOf<Pair<Long, Pair<String, String>>>()
+            usable.forEach { row ->
+                val id = container.registry.enqueue(row.number, row.ifsc, _state.value.bankCode)
+                if (id != null) claimed += id to (row.number to row.ifsc)
+            }
+            if (claimed.isEmpty()) {
+                _state.update { it.copy(error = "Every account in the queue is already in the registry") }
                 return@launch
             }
             val runId = container.engine.createTransferRun(
-                Banks.byCode(bank)!!, 1L, RunMode.HARVEST, current.stealthLevel
+                Banks.byCode(_state.value.bankCode) ?: Banks.all.first(),
+                1L,
+                RunMode.HARVEST,
+                settings.stealthLevel
             )
-            _runId.value = runId
-            _interrupted.value = null
-            // Registry rows are stamped SENT before any request leaves the device.
-            ids.forEach { (id, _) ->
-                container.registry.outcome(id, HarvestStatus.SENT, null, null, 1L)
-            }
-            container.engine.performHarvestRun(runId, current, bank, ids)
-            _queue.value = emptyList()
-            _running.value = false
+            _state.update { it.copy(activeRunId = runId, running = true, error = null) }
+            container.engine.performHarvestRun(runId, settings, _state.value.bankCode, claimed)
         }
     }
 
-    fun resumeInterrupted() {
-        val open = _interrupted.value ?: return
+    fun resume() {
+        val runId = _state.value.activeRunId ?: return
         viewModelScope.launch {
-            _running.value = true
-            _error.value = null
-            container.engine.resume(open.id)
-            val pending = container.registry.unfinished()
-                .filter { it.status == HarvestStatus.PENDING.name }
-                .map { it.id to (it.accountNumber to it.ifsc) }
-            if (pending.isNotEmpty()) {
-                container.engine.performHarvestRun(open.id, settings.value, open.bankCode, pending)
-            } else {
-                _message.value = "nothing left to resume for that run"
-            }
-            _interrupted.value = null
-            _running.value = false
-        }
-    }
-
-    fun retryRejected(leg: HarvestLegEntity, onNewRun: (Long) -> Unit) {
-        viewModelScope.launch {
-            val current = settings.value
-            val bank = _bankCode.value
-            val runId = container.engine.createTransferRun(
-                Banks.byCode(bank) ?: return@launch, 1L, RunMode.HARVEST, current.stealthLevel
-            )
-            container.registry.forceReset(leg.registryId)
-            val pair = leg.registryId to (leg.accountNumber to leg.ifsc)
-            _runId.value = runId
-            onNewRun(runId)
-            _running.value = true
-            container.engine.performHarvestRun(runId, current, bank, listOf(pair))
-            _running.value = false
+            val settings = container.settings.flow.first()
+            container.engine.resume(runId)
+            _state.update { it.copy(pauseDialog = false, running = true, error = null) }
+            container.engine.resumeHarvest(runId, settings)
         }
     }
 
     fun cancel() {
-        val id = _runId.value ?: return
+        val runId = _state.value.activeRunId ?: return
         viewModelScope.launch {
-            container.engine.cancel(id)
-            _running.value = false
-            _message.value = "Harvest cancelled — finished accounts stay in the registry"
+            container.engine.cancel(runId)
+            _state.update { it.copy(running = false) }
         }
     }
 
-    fun export(onUri: (android.net.Uri) -> Unit) {
-        val id = _runId.value ?: return
+    fun retryLeg(leg: HarvestLegEntity) {
         viewModelScope.launch {
-            val rows = container.runs.legs(id)
-            val collected = withContext(Dispatchers.IO) {
-                var list: List<HarvestLegEntity> = emptyList()
-                rows.collect { list = it; return@collect }
-                list
-            }
-            if (collected.isEmpty()) {
-                _message.value = "no legs to export yet"
-                return@launch
-            }
-            val uri = withContext(Dispatchers.IO) {
-                container.exporter.writeCsv(
-                    "harvest_$id.csv",
-                    "ts,account,ifsc,paise,status,utr,reason",
-                    collected.map { "${it.ts},${it.accountNumber},${it.ifsc},${it.amountPaise},${it.status},${it.utr ?: ""},${it.reason ?: ""}" }
-                )
-            }
-            onUri(uri)
+            val settings = container.settings.flow.first()
+            container.registry.forceReset(leg.registryId)
+            val bank = Banks.byCode(_state.value.bankCode) ?: Banks.all.first()
+            val runId = container.engine.createTransferRun(bank, 1L, RunMode.HARVEST, settings.stealthLevel)
+            _state.update { it.copy(activeRunId = runId, running = true) }
+            container.engine.performHarvestRun(runId, settings, bank.code, listOf(leg.registryId to (leg.accountNumber to leg.ifsc)))
         }
     }
 
-    fun dismissError() { _error.value = null }
-    fun dismissMessage() { _message.value = null }
+    fun export(legs: List<HarvestLegEntity>, totalPaise: Long) = viewModelScope.launch {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val rows = legs.map {
+            "${it.ts},${it.accountNumber},${it.ifsc},${it.amountPaise},${it.status},${it.utr.orEmpty()},${(it.reason ?: "").replace(",", ";")}"
+        } + "TOTAL,,,,$totalPaise,,"
+        val uri = container.exporter.writeCsv(
+            "ghostbank_harvest_$stamp.csv",
+            "timestamp,account,ifsc,amount_paise,status,utr,reason",
+            rows
+        )
+        container.exporter.share(uri, "GhostBank harvest")
+    }
+
+    fun summaryOf(legs: List<HarvestLegEntity>): String {
+        val sent = legs.count { it.status != HarvestStatus.PENDING.name }
+        val settled = legs.count { it.status == HarvestStatus.SETTLED.name }
+        val floor = legs.count { it.status == HarvestStatus.FLOOR.name }
+        val rejected = legs.count { it.status == HarvestStatus.REJECTED.name }
+        return "sent $sent / settled $settled / floor $floor / rejected $rejected"
+    }
 
     companion object {
         fun factory(container: AppContainer): ViewModelProvider.Factory = viewModelFactory {

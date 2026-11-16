@@ -1,20 +1,14 @@
-=== ABOUT: The bank list, grouped public, private and small finance, each with its cap and rail quirk ===
 package com.arin.ghostbank.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -24,46 +18,29 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.lifecycle.viewmodel.initializer
-import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.ghostbank.AppContainer
-import com.arin.ghostbank.data.db.AccountEntity
 import com.arin.ghostbank.model.Bank
 import com.arin.ghostbank.model.BankGroup
 import com.arin.ghostbank.model.Banks
 import com.arin.ghostbank.model.Ids
+import com.arin.ghostbank.ui.components.EmptyState
+import com.arin.ghostbank.ui.components.Panel
 import com.arin.ghostbank.ui.components.Pill
+import com.arin.ghostbank.ui.components.ScreenColumn
 import com.arin.ghostbank.ui.components.SectionTitle
-import com.arin.ghostbank.ui.components.TerminalButton
-import com.arin.ghostbank.ui.components.paiseToRupeeText
-import com.arin.ghostbank.ui.components.timeText
+import com.arin.ghostbank.ui.components.clickableNoRipple
+import com.arin.ghostbank.ui.components.paiseToRupees
 import com.arin.ghostbank.ui.theme.Amber
 import com.arin.ghostbank.ui.theme.Cyan
 import com.arin.ghostbank.ui.theme.Green
 import com.arin.ghostbank.ui.theme.Hairline
-import com.arin.ghostbank.ui.theme.Ink
 import com.arin.ghostbank.ui.theme.InkCard
+import com.arin.ghostbank.ui.theme.Red
 import com.arin.ghostbank.ui.theme.TextDim
 import com.arin.ghostbank.ui.theme.TextPrimary
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.stateIn
-
-class BanksViewModel(container: AppContainer) : ViewModel() {
-    val destination: StateFlow<AccountEntity?> = container.accounts.destination()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-
-    companion object {
-        fun factory(container: AppContainer): ViewModelProvider.Factory = viewModelFactory {
-            initializer { BanksViewModel(container) }
-        }
-    }
-}
+import com.arin.ghostbank.ui.vm.BanksViewModel
 
 @Composable
 fun BanksScreen(
@@ -75,114 +52,86 @@ fun BanksScreen(
     val vm: BanksViewModel = viewModel(factory = BanksViewModel.factory(container))
     val destination by vm.destination.collectAsStateWithLifecycle()
 
-    LazyColumn(
-        Modifier
-            .fillMaxSize()
-            .background(Ink)
-            .padding(horizontal = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        item {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(InkCard)
-                    .border(1.dp, if (destination == null) Amber else Green, RoundedCornerShape(6.dp))
-                    .padding(12.dp)
-            ) {
-                Text("DESTINATION", style = MaterialTheme.typography.labelSmall, color = TextDim)
-                if (destination == null) {
+    ScreenColumn {
+        val dest = destination
+        if (dest == null) {
+            Panel(border = Amber) {
+                Column {
+                    Text("no destination account", style = MaterialTheme.typography.titleSmall, color = Amber)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "No account saved yet — every leg needs a fixed landing account.",
+                        "Every leg credits your account. Save it once and it is masked to the last four digits.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Amber
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    TerminalButton("ADD DESTINATION ACCOUNT", onDestination)
-                } else {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "${Ids.maskNumber(destination!!.number)} · ${destination!!.ifsc}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Green
-                    )
-                    Text(
-                        "saved ${timeText(destination!!.createdAt)}",
-                        style = MaterialTheme.typography.labelSmall,
                         color = TextDim
                     )
-                    Spacer(Modifier.height(10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        TerminalButton("EDIT", onDestination, color = Cyan, modifier = Modifier.weight(1f))
-                        TerminalButton("SETTINGS", onSettings, color = TextDim, modifier = Modifier.weight(1f))
+                    Spacer(Modifier.height(8.dp))
+                    Text("SET DESTINATION →", style = MaterialTheme.typography.labelLarge, color = Amber,
+                        modifier = Modifier.clickableNoRipple(onDestination))
+                }
+            }
+        } else {
+            Panel(border = Green) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("DESTINATION LOCKED", style = MaterialTheme.typography.labelSmall, color = Green)
+                        Text(
+                            Ids.maskNumber(dest.number) + " · " + dest.ifsc,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextPrimary
+                        )
+                        Text(dest.holderName ?: "unnamed", style = MaterialTheme.typography.bodySmall, color = TextDim)
                     }
+                    Text("EDIT", style = MaterialTheme.typography.labelLarge, color = Cyan,
+                        modifier = Modifier.clickableNoRipple(onDestination))
                 }
             }
         }
 
-        item { SectionTitle("PICK A TARGET", "each row is one live bank portal") }
+        SectionTitle("pick a target", "each bank shows its own per-transaction cap, IMPS support and rail quirk")
 
         BankGroup.values().forEach { group ->
-            item {
-                Text(
-                    when (group) {
-                        BankGroup.PUBLIC -> "// PUBLIC SECTOR"
-                        BankGroup.PRIVATE -> "// PRIVATE"
-                        BankGroup.SFB -> "// SMALL FINANCE BANKS"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextDim,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
-            }
-            items(Banks.all.filter { it.group == group }) { bank ->
+            Text(
+                when (group) {
+                    BankGroup.PUBLIC -> "// public sector"
+                    BankGroup.PRIVATE -> "// private"
+                    BankGroup.SFB -> "// small finance"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = Cyan
+            )
+            Banks.all.filter { it.group == group }.forEach { bank ->
                 BankRow(bank) { onBank(bank.code) }
             }
         }
 
-        item {
-            Text(
-                "Caps are the retail per-transaction ceilings published for net banking. The rail is IMPS P2A only — real time, 24x7, no NEFT batches.",
-                style = MaterialTheme.typography.bodySmall,
-                color = TextDim,
-                modifier = Modifier.padding(vertical = 16.dp)
-            )
+        if (Banks.all.isEmpty()) {
+            EmptyState("no banks loaded", "open settings", onSettings)
         }
+        Text("caps are shown in rupees; all amounts are held internally in paise", style = MaterialTheme.typography.labelSmall, color = TextDim)
     }
 }
 
 @Composable
 private fun BankRow(bank: Bank, onClick: () -> Unit) {
-    Row(
+    Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(6.dp))
             .background(InkCard)
             .border(1.dp, Hairline, RoundedCornerShape(6.dp))
-            .clickable(onClick = onClick)
-            .padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .clickableNoRipple(onClick)
+            .padding(12.dp)
     ) {
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(bank.name, style = MaterialTheme.typography.titleSmall, color = TextPrimary)
-                Spacer(Modifier.width(8.dp))
-                Pill(bank.code, Cyan)
-                if (bank.impsSupported) {
-                    Spacer(Modifier.width(6.dp))
-                    Pill("IMPS", Green)
-                }
-            }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "cap ${paiseToRupeeText(bank.capPaise)} per txn",
-                style = MaterialTheme.typography.bodySmall,
-                color = Amber
-            )
-            Text(bank.quirk, style = MaterialTheme.typography.bodySmall, color = TextDim)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(bank.name, style = MaterialTheme.typography.titleSmall, color = TextPrimary, modifier = Modifier.weight(1f))
+            Pill(bank.code, Cyan)
         }
-        Text("›", style = MaterialTheme.typography.titleMedium, color = TextDim)
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Pill("CAP " + paiseToRupees(bank.capPaise), Amber)
+            Pill(if (bank.impsSupported) "IMPS 24x7" else "IMPS unavailable", if (bank.impsSupported) Green else Red)
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(bank.quirk, style = MaterialTheme.typography.bodySmall, color = TextDim)
     }
 }

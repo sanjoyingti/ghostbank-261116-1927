@@ -11,86 +11,63 @@ import com.arin.ghostbank.model.Banks
 import com.arin.ghostbank.model.StealthLevel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+
+data class OnboardingState(
+    val page: Int = 0,
+    val level: StealthLevel = StealthLevel.STANDARD,
+    val number: String = "",
+    val ifsc: String = "",
+    val holder: String = "",
+    val error: String? = null,
+    val saving: Boolean = false,
+    val finished: Boolean = false
+)
 
 class OnboardingViewModel(private val container: AppContainer) : ViewModel() {
 
-    private val _page = MutableStateFlow(0)
-    val page = _page.asStateFlow()
+    private val _state = MutableStateFlow(OnboardingState())
+    val state = _state.asStateFlow()
 
-    private val _level = MutableStateFlow(StealthLevel.STANDARD)
-    val level = _level.asStateFlow()
+    fun next() = _state.update { it.copy(page = (it.page + 1).coerceAtMost(2)) }
+    fun back() = _state.update { it.copy(page = (it.page - 1).coerceAtLeast(0)) }
+    fun setLevel(level: StealthLevel) = _state.update { it.copy(level = level) }
 
-    private val _number = MutableStateFlow("")
-    val number = _number.asStateFlow()
-
-    private val _ifsc = MutableStateFlow("")
-    val ifsc = _ifsc.asStateFlow()
-
-    private val _holder = MutableStateFlow("")
-    val holder = _holder.asStateFlow()
-
-    private val _error = MutableStateFlow<String?>(null)
-    val error = _error.asStateFlow()
-
-    private val _busy = MutableStateFlow(false)
-    val busy = _busy.asStateFlow()
-
-    fun next() {
-        _page.value = (_page.value + 1).coerceAtMost(2)
-        _error.value = null
+    fun setNumber(value: String) = _state.update {
+        it.copy(number = value.filter { c -> c.isDigit() }.take(18), error = null)
     }
 
-    fun back() {
-        _page.value = (_page.value - 1).coerceAtLeast(0)
+    fun setIfsc(value: String) = _state.update {
+        it.copy(ifsc = value.uppercase().filter { c -> c.isLetterOrDigit() }.take(11), error = null)
     }
 
-    fun setLevel(value: StealthLevel) {
-        _level.value = value
-    }
+    fun setHolder(value: String) = _state.update { it.copy(holder = value.take(40)) }
 
-    fun setNumber(value: String) {
-        _number.value = value.filter { it.isDigit() }.take(18)
-    }
-
-    fun setIfsc(value: String) {
-        _ifsc.value = value.uppercase().filter { it.isLetterOrDigit() }.take(11)
-    }
-
-    fun setHolder(value: String) {
-        _holder.value = value.take(40)
-    }
-
-    val ifscHint: String?
-        get() = BranchResolver.formatHint(_ifsc.value)
-
-    val branch: String?
-        get() = BranchResolver.resolve(_ifsc.value)?.let { "${it.bankName} · ${it.branchLabel}" }
-
-    fun finish(onDone: () -> Unit) = viewModelScope.launch {
-        val digits = _number.value
-        val code = _ifsc.value
-        if (digits.length < 9) {
-            _error.value = "account number needs at least 9 digits"
-            return@launch
+    fun finish() {
+        val current = _state.value
+        val number = current.number.trim()
+        val ifsc = current.ifsc.trim().uppercase()
+        val bank = Banks.byIfsc(ifsc)
+        val problem = when {
+            number.length < 9 -> "Account number looks too short"
+            !Banks.isValidIfsc(ifsc) -> BranchResolver.formatHint(ifsc) ?: "IFSC must be 4 letters, a 0, then 6 characters"
+            bank == null -> "That IFSC is not one of the 27 supported banks"
+            else -> null
         }
-        if (!Banks.isValidIfsc(code)) {
-            _error.value = "IFSC shape must be 4 letters, a 0, then 6 letters or digits"
-            return@launch
+        if (problem != null) {
+            _state.update { it.copy(error = problem) }
+            return
         }
-        val bank = Banks.byIfsc(code)
-        if (bank == null) {
-            _error.value = "that IFSC is not one of the 27 supported banks"
-            return@launch
+        viewModelScope.launch {
+            _state.update { it.copy(saving = true) }
+            container.accounts.saveDestination(number, ifsc, current.holder.ifBlank { null }, bank!!.code)
+            container.settings.setStealthLevel(current.level)
+            container.settings.setDestinationSaved(true)
+            container.settings.setOnboardingDone(true)
+            _state.update { it.copy(saving = false, finished = true) }
         }
-        _busy.value = true
-        container.accounts.saveDestination(digits, code, _holder.value.ifBlank { null }, bank.code)
-        container.settings.setStealthLevel(_level.value)
-        if (_level.value == StealthLevel.GHOST) container.settings.setTorMode(true)
-        container.settings.setDestinationSaved(true)
-        container.settings.setOnboardingDone(true)
-        _busy.value = false
-        onDone()
     }
 
     companion object {
