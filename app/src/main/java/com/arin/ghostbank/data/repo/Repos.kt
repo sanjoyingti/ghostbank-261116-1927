@@ -1,4 +1,3 @@
-=== ABOUT: Small helpers that read and write accounts, the dedupe registry, the ledger and run logs ===
 package com.arin.ghostbank.data.repo
 
 import com.arin.ghostbank.data.db.AccountDao
@@ -43,6 +42,7 @@ class RegistryRepository(private val dao: RegistryDao) {
     fun search(q: String): Flow<List<RegistryEntity>> = dao.search(q)
     suspend fun byHash(hash: String): RegistryEntity? = dao.byHash(hash)
     suspend fun unfinished(): List<RegistryEntity> = dao.unfinished()
+    fun count(): Flow<Int> = dao.count()
 
     /** Writes the dedupe record BEFORE the request leaves the device. */
     suspend fun claim(accountNumber: String, ifsc: String, bankCode: String, amountPaise: Long, now: Long): RegistryEntity {
@@ -68,13 +68,34 @@ class RegistryRepository(private val dao: RegistryDao) {
         return entity.copy(id = if (id > 0) id else (dao.byHash(hash)?.id ?: 0))
     }
 
+    /** Parks an account in the queue as PENDING without claiming it yet. Null if it is already known. */
+    suspend fun enqueue(accountNumber: String, ifsc: String, bankCode: String): Long? {
+        val hash = Ids.sha256("${accountNumber.trim()}|${ifsc.trim().uppercase()}")
+        dao.byHash(hash)?.let { return null }
+        val now = System.currentTimeMillis()
+        val id = dao.insertIgnore(
+            RegistryEntity(
+                hash = hash,
+                accountNumber = accountNumber.trim(),
+                ifsc = ifsc.trim().uppercase(),
+                bankCode = bankCode,
+                status = HarvestStatus.PENDING.name,
+                utr = null,
+                reason = null,
+                amountPaise = 0,
+                firstSeen = now,
+                lastAttempt = now
+            )
+        )
+        return if (id > 0) id else dao.byHash(hash)?.id
+    }
+
     suspend fun outcome(id: Long, status: HarvestStatus, utr: String?, reason: String?, amountPaise: Long) {
         dao.updateOutcome(id, status.name, utr, reason, amountPaise, System.currentTimeMillis())
     }
 
     suspend fun forceReset(id: Long) = dao.forceReset(id, System.currentTimeMillis())
     suspend fun wipe() = dao.wipe()
-    fun count(): Flow<Int> = dao.count()
 }
 
 class RunRepository(

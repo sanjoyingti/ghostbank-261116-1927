@@ -10,147 +10,160 @@ import com.arin.ghostbank.data.Settings
 import com.arin.ghostbank.data.db.RunEntity
 import com.arin.ghostbank.data.db.StageLogEntity
 import com.arin.ghostbank.data.net.LeakState
-import com.arin.ghostbank.data.net.ProxyEngine
 import com.arin.ghostbank.model.Bank
 import com.arin.ghostbank.model.Banks
+import com.arin.ghostbank.model.ErrorKind
+import com.arin.ghostbank.model.GhostError
+import com.arin.ghostbank.model.Money
 import com.arin.ghostbank.model.REMITTER_PROFILES
+import com.arin.ghostbank.model.RemitterProfile
 import com.arin.ghostbank.model.RunMode
-import com.arin.ghostbank.model.RunStatus
 import com.arin.ghostbank.model.StealthLevel
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlin.math.roundToLong
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class TransferViewModel(private val container: AppContainer, bankCode: String) : ViewModel() {
+class TransferViewModel(private val container: AppContainer, val bankCode: String) : ViewModel() {
 
     val bank: Bank? = Banks.byCode(bankCode)
 
-    val destination = container.accounts.destination()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-
-    val settings: StateFlow<Settings> = container.settings.flow
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), Settings())
-
-    private val _mode = MutableStateFlow(RunMode.HARVEST)
-    val mode = _mode.asStateFlow()
-
-    private val _amountText = MutableStateFlow("")
-    val amountText = _amountText.asStateFlow()
+    private val _amount = MutableStateFlow("")
+    val amount: StateFlow<String> = _amount.asStateFlow()
 
     private val _sourceIndex = MutableStateFlow(0)
-    val sourceIndex = _sourceIndex.asStateFlow()
+    val sourceIndex: StateFlow<Int> = _sourceIndex.asStateFlow()
 
-    private val _error = MutableStateFlow<String?>(null)
-    val error = _error.asStateFlow()
+    private val _runId = MutableStateFlow<Long?>(null)
+    val runId: StateFlow<Long?> = _runId.asStateFlow()
 
-    private val _busy = MutableStateFlow(false)
-    val busy = _busy.asStateFlow()
-
-    private val runId = MutableStateFlow<Long?>(null)
-
-    val run: StateFlow<RunEntity?> = runId
-        .flatMapLatest { id -> if (id == null) flowOf(null) else container.runs.byId(id) }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-
-    val stages: StateFlow<List<StageLogEntity>> = runId
+    val logs: StateFlow<List<StageLogEntity>> = _runId
         .flatMapLatest { id -> if (id == null) flowOf(emptyList()) else container.runs.logs(id) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val score: StateFlow<Int> = runId
-        .flatMapLatest { id -> if (id == null) flowOf(100) else container.db.scores().byRun(id) }
-        .let { flow -> flow }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 100)
+    val run: StateFlow<RunEntity?> = _runId
+        .flatMapLatest { id -> if (id == null) flowOf(null) else container.runs.byId(id) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
-    private var job: Job? = null
+    val settings: StateFlow<Settings> = container.settings.flow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, Settings())
 
-    fun setMode(value: RunMode) {
-        _mode.value = value
-        _error.value = null
-    }
+    private val _running = MutableStateFlow(false)
+    val running: StateFlow<Boolean> = _running.asStateFlow()
+
+    private val _error = MutableStateFlow<GhostError?>(null)
+    val error: StateFlow<GhostError?> = _error.asStateFlow()
+
+    private val _showConfirm = MutableStateFlow(false)
+    val showConfirm: StateFlow<Boolean> = _showConfirm.asStateFlow()
+
+    private val _missingDestination = MutableStateFlow(false)
+    val missingDestination: StateFlow<Boolean> = _missingDestination.asStateFlow()
+
+    private val _budgetLeft = MutableStateFlow(0)
+    val budgetLeft: StateFlow<Int> = _budgetLeft.asStateFlow()
+
+    private val _message = MutableStateFlow<String?>(null)
+    val message: StateFlow<String?> = _message.asStateFlow()
 
     fun setAmount(value: String) {
-        _amountText.value = value.filter { it.isDigit() || it == '.' }.take(12)
+        val filtered = value.filter { it.isDigit() || it == '.' }.take(12)
+        _amount.value = filtered
         _error.value = null
     }
 
-    fun setSource(index: Int) {
-        _sourceIndex.value = index
-    }
+    fun setSource(index: Int) { _sourceIndex.value = index }
 
-    fun amountPaise(): Long {
-        if (_mode.value == RunMode.HARVEST) return 1L
-        val parsed = _amountText.value.trim().toDoubleOrNull() ?: return 0L
-        return (parsed * 100).roundToLong()
-    }
-
-    fun start() = viewModelScope.launch {
-        val bankNow = bank ?: return@launch
-        val destinationNow = container.accounts.current()
-        if (destinationNow == null) {
-            _error.value = "save your destination account first"
-            return@launch
+    fun ask() {
+        val b = bank ?: return
+        val paise = Money.parseRupees(_amount.value)
+        if (paise == null) {
+            _error.value = GhostError(ErrorKind.CONFIG, "That amount is not a number.", "Type rupees, for example 250 or 250.50")
+            return
         }
-        val paise = amountPaise()
         if (paise < 100) {
-            _error.value = "the rail floor is ₹1 — enter at least 1 rupee"
-            return@launch
+            _error.value = GhostError(ErrorKind.RAIL_FLOOR, "IMPS needs at least ₹1.", "Raise the amount to ₹1 or more")
+            return
         }
-        if (paise > bankNow.capPaise) {
-            _error.value = "${bankNow.name} caps a single transaction at ₹${bankNow.capPaise / 100}"
-            return@launch
+        if (paise > b.capPaise) {
+            _error.value = GhostError(ErrorKind.CONFIG, "${b.name} caps a single transfer at ${Money.format(b.capPaise)}.", "Lower the amount")
+            return
         }
-        val settingsNow = container.settings.flow.first()
-        if (settingsNow.stealthLevel == StealthLevel.GHOST) {
-            val exitOk = runCatching { container.proxyEngine.pick(settingsNow) }.getOrNull() != null
-            if (!exitOk) {
-                _error.value = "Ghost level is on but no exit is configured — add a proxy or enable Tor in Settings"
+        _showConfirm.value = true
+    }
+
+    fun dismissConfirm() { _showConfirm.value = false }
+
+    fun sources(): List<RemitterProfile> {
+        val b = bank ?: return REMITTER_PROFILES
+        return REMITTER_PROFILES + RemitterProfile("${b.code} own P2A route", "ONUS-${b.code}", "ONUS0000001")
+    }
+
+    private fun selectedSource(): RemitterProfile = sources().getOrElse(_sourceIndex.value) { REMITTER_PROFILES.first() }
+
+    fun run() {
+        val b = bank ?: return
+        val paise = Money.parseRupees(_amount.value) ?: return
+        if (_running.value) return
+        viewModelScope.launch {
+            _running.value = true
+            _error.value = null
+            _missingDestination.value = false
+            val current = settings.value
+            _budgetLeft.value = current.entropyBudget
+            if (container.accounts.current() == null) {
+                _missingDestination.value = true
+                _running.value = false
                 return@launch
             }
-            if (LeakState.passed == false) {
-                _error.value = "the last leak lab check failed — run it again from Shield before sending at Ghost level"
-                return@launch
+            if (current.stealthLevel == StealthLevel.GHOST && LeakState.passed != true) {
+                val report = container.leakLab.probe(current)
+                if (!report.passed) {
+                    _error.value = GhostError(
+                        ErrorKind.CONFIG,
+                        "Ghost level is on and the leak lab has not passed, so nothing was sent.",
+                        "Run the leak lab from the Shield tab, fix the exit, then run again",
+                        report.error
+                    )
+                    _running.value = false
+                    return@launch
+                }
             }
-        }
-        val source = REMITTER_PROFILES.getOrNull(_sourceIndex.value) ?: REMITTER_PROFILES.first()
-        val id = container.engine.createTransferRun(bankNow, paise, _mode.value, settingsNow.stealthLevel)
-        runId.value = id
-        _busy.value = true
-        job = viewModelScope.launch {
-            runCatching { container.engine.performTransferRun(id, settingsNow, source) }
-            _busy.value = false
+            val id = container.engine.createTransferRun(b, paise, RunMode.TRANSFER, current.stealthLevel)
+            _runId.value = id
+            container.engine.performTransferRun(id, current, selectedSource())
+            _running.value = false
         }
     }
 
-    fun retry() = viewModelScope.launch {
-        val id = runId.value ?: return@launch
-        val current = container.runs.byIdOnce(id) ?: return@launch
-        if (current.status == RunStatus.RUNNING.name) return@launch
-        val source = REMITTER_PROFILES.getOrNull(_sourceIndex.value) ?: REMITTER_PROFILES.first()
-        val settingsNow = container.settings.flow.first()
-        container.engine.resume(id)
-        _busy.value = true
-        job = viewModelScope.launch {
-            runCatching { container.engine.retryTransfer(id, settingsNow, source) }
-            _busy.value = false
+    fun retry() {
+        val id = _runId.value ?: return
+        if (_running.value) return
+        viewModelScope.launch {
+            _running.value = true
+            _error.value = null
+            container.engine.retryTransfer(id, settings.value, selectedSource())
+            _running.value = false
         }
     }
 
-    fun cancel() = viewModelScope.launch {
-        val id = runId.value ?: return@launch
-        container.engine.cancel(id)
-        job?.cancel()
-        _busy.value = false
+    fun cancel() {
+        val id = _runId.value ?: return
+        viewModelScope.launch {
+            container.engine.cancel(id)
+            _running.value = false
+            _message.value = "Run cancelled"
+        }
     }
+
+    fun dismissError() { _error.value = null }
+    fun dismissMessage() { _message.value = null }
 
     companion object {
         fun factory(container: AppContainer, bankCode: String): ViewModelProvider.Factory = viewModelFactory {

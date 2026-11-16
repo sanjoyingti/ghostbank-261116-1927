@@ -1,4 +1,3 @@
-=== ABOUT: Filters the raw request and response console by stage and status code ===
 package com.arin.ghostbank.ui.vm
 
 import androidx.lifecycle.ViewModel

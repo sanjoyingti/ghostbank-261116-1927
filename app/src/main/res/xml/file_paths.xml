@@ -1,4 +1,3 @@
-=== ABOUT: Tells Android which folder the exported CSV files may be shared from ===
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <cache-path name="exports" path="exports/" />

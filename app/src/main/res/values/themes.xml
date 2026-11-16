@@ -1,10 +1,9 @@
-=== ABOUT: The near-black window background so the app never flashes white on launch ===
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.GhostBank" parent="android:Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#FF050607</item>
-        <item name="android:statusBarColor">#FF050607</item>
-        <item name="android:navigationBarColor">#FF050607</item>
+        <item name="android:windowBackground">#050607</item>
+        <item name="android:statusBarColor">#050607</item>
+        <item name="android:navigationBarColor">#050607</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

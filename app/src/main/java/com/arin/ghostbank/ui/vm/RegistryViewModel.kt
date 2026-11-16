@@ -1,4 +1,3 @@
-=== ABOUT: Searches the dedupe registry and forces a single row to be harvestable again ===
 package com.arin.ghostbank.ui.vm
 
 import androidx.lifecycle.ViewModel
@@ -23,13 +22,15 @@ class RegistryViewModel(private val container: AppContainer) : ViewModel() {
     private val _query = MutableStateFlow("")
     val query: StateFlow<String> = _query.asStateFlow()
 
-    val rows: StateFlow<List<RegistryEntity>> = _query.flatMapLatest { q ->
-        if (q.isBlank()) container.registry.all() else container.registry.search(q)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val entries: StateFlow<List<RegistryEntity>> = _query
+        .flatMapLatest { q -> if (q.isBlank()) container.registry.all() else container.registry.search(q) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun setQuery(value: String) { _query.value = value }
 
-    fun force(id: Long) = viewModelScope.launch { container.registry.forceReset(id) }
+    fun force(id: Long) = viewModelScope.launch {
+        container.registry.forceReset(id)
+    }
 
     fun wipe() = viewModelScope.launch { container.registry.wipe() }
 
